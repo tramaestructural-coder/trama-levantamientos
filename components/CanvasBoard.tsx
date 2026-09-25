@@ -74,15 +74,28 @@ const WALL_ALIGN_DIST = 0.5; // meters — how close a door/window has to get to
 // Dimension text sized in WORLD units (constant / DEFAULT_SCALE) instead of
 // screen px (constant / current scale) — it grows and shrinks along with
 // the drawing itself as you zoom, instead of staying a fixed size that
-// overwhelms a zoomed-out plan or looks tiny against a zoomed-in one.
-const DIM_FONT_SIZE = 13 / DEFAULT_SCALE;
-const DIM_FONT_SIZE_SMALL = 12 / DEFAULT_SCALE;
+// overwhelms a zoomed-out plan or looks tiny against a zoomed-in one. Kept
+// small so tightly-packed dimensions (e.g. several short wall segments)
+// don't crowd each other out.
+const DIM_FONT_SIZE = 10 / DEFAULT_SCALE;
+const DIM_FONT_SIZE_SMALL = 9 / DEFAULT_SCALE;
 
 // This app measures in centimeters — world units stay meters internally
 // (geometry, grid, snapping), but every linear measurement is shown/typed
 // as a bare whole-number cm value ("un muro de 1 metro" reads as "100").
 function formatCm(meters: number): string {
   return Math.round(meters * 100).toString();
+}
+
+// Konva's Text `align` prop only centers within an explicit `width` box, so
+// a plain anchored Text is left-aligned at its x, not centered on it — for
+// a short bare number that reads as visibly off-center from the thing it's
+// measuring. These are all set in the monospace font stack, so every
+// character has the same width; approximate it to compute an offsetX that
+// puts the text's actual center on the anchor point instead.
+const DIM_CHAR_WIDTH_RATIO = 0.6;
+function dimOffsetX(text: string, fontSize: number): number {
+  return (text.length * fontSize * DIM_CHAR_WIDTH_RATIO) / 2;
 }
 
 type Tool = "line" | "curve" | "stretch" | "select" | "rect" | "ellipse" | "note" | "text" | "eraser" | "pan" | "area" | "ruler";
@@ -1229,15 +1242,18 @@ export default function CanvasBoard({ boardId }: { boardId: string }) {
     e.target.position(target);
 
     if (wallHit) {
-      // Read toward whichever wall end the frame is extending towards (its
-      // mirror*angle direction) — mirroring the door should read the
-      // opposite end, not just whichever end happens to be nearer.
-      const mirror = s.mirror ?? 1;
-      const forward = { x: Math.cos(angle) * mirror, y: Math.sin(angle) * mirror };
-      const projStart = (wallHit.lineStart.x - target.x) * forward.x + (wallHit.lineStart.y - target.y) * forward.y;
-      const projEnd = (wallHit.lineEnd.x - target.x) * forward.x + (wallHit.lineEnd.y - target.y) * forward.y;
-      const chosen = projStart >= projEnd ? wallHit.lineStart : wallHit.lineEnd;
-      setDoorHingeReadout({ x: target.x, y: target.y, text: formatCm(distance(target, chosen)) });
+      // Always read toward the nearer wall end — a placement aid for how far
+      // the hinge sits from the corner, regardless of which way the door
+      // is mirrored.
+      const chosen =
+        distance(target, wallHit.lineStart) <= distance(target, wallHit.lineEnd)
+          ? wallHit.lineStart
+          : wallHit.lineEnd;
+      setDoorHingeReadout({
+        x: (target.x + chosen.x) / 2,
+        y: (target.y + chosen.y) / 2,
+        text: formatCm(distance(target, chosen)),
+      });
     } else {
       setDoorHingeReadout(null);
     }
@@ -1812,8 +1828,8 @@ export default function CanvasBoard({ boardId }: { boardId: string }) {
                           fontSize={DIM_FONT_SIZE}
                           fontFamily="ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace"
                           fill="#1c1b1a"
-                          align="center"
-                          offsetX={30 / DEFAULT_SCALE}
+                          offsetX={dimOffsetX(`${area.toFixed(2)} m²`, DIM_FONT_SIZE)}
+                          offsetY={DIM_FONT_SIZE / 2}
                           listening={false}
                         />
                       )}
@@ -2135,9 +2151,8 @@ export default function CanvasBoard({ boardId }: { boardId: string }) {
                     fontSize={DIM_FONT_SIZE_SMALL}
                     fontFamily="ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace"
                     fill="#c2410c"
-                    padding={3 / DEFAULT_SCALE}
-                    offsetY={26 / DEFAULT_SCALE}
-                    align="center"
+                    offsetX={dimOffsetX(doorHingeReadout.text, DIM_FONT_SIZE_SMALL)}
+                    offsetY={18 / DEFAULT_SCALE}
                     listening={false}
                   />
                 )}
@@ -2158,8 +2173,8 @@ export default function CanvasBoard({ boardId }: { boardId: string }) {
                       fontSize={DIM_FONT_SIZE}
                       fontFamily="ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace"
                       fill="#c2410c"
+                      offsetX={dimOffsetX(formatCm(distance(drawingLine.start, drawingLine.end)), DIM_FONT_SIZE)}
                       offsetY={18 / DEFAULT_SCALE}
-                      align="center"
                       listening={false}
                     />
                   </>
@@ -2215,8 +2230,11 @@ export default function CanvasBoard({ boardId }: { boardId: string }) {
                           fontSize={DIM_FONT_SIZE}
                           fontFamily="ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace"
                           fill="#c2410c"
+                          offsetX={dimOffsetX(
+                            formatCm(distance(ruler.start, (ruler.end ?? ruler.hover)!)),
+                            DIM_FONT_SIZE
+                          )}
                           offsetY={18 / DEFAULT_SCALE}
-                          align="center"
                           listening={false}
                         />
                       </>
@@ -2302,19 +2320,24 @@ export default function CanvasBoard({ boardId }: { boardId: string }) {
 
                 {showLabels &&
                   board.lines.map((l) => {
-                    const mid = { x: (l.x1 + l.x2) / 2, y: (l.y1 + l.y2) / 2 };
+                    // `l.mid` is where the curve actually passes at its
+                    // midpoint (see sampleCurvePoints) — for a straight line
+                    // it equals the straight midpoint, so this centers the
+                    // label on the visible line either way.
+                    const mid = l.mid;
+                    const text = l.value ? formatCm(parseFloat(l.value)) : "…";
                     return (
                       <Text
                         key={`${l.id}-label`}
                         x={mid.x}
                         y={mid.y}
-                        text={l.value ? formatCm(parseFloat(l.value)) : "…"}
+                        text={text}
                         fontSize={DIM_FONT_SIZE}
                         fontFamily="ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace"
                         fill={l.value ? "#1c1b1a" : "#a8a29e"}
                         padding={3 / DEFAULT_SCALE}
+                        offsetX={dimOffsetX(text, DIM_FONT_SIZE)}
                         offsetY={18 / DEFAULT_SCALE}
-                        align="center"
                         onClick={() => openValueEditor(l, true)}
                         onTap={() => openValueEditor(l, true)}
                       />
@@ -2329,18 +2352,19 @@ export default function CanvasBoard({ boardId }: { boardId: string }) {
                     const offset = 14 / scale;
                     const mid = { x: s.x + (cos * s.length) / 2, y: s.y + (sin * s.length) / 2 };
                     const isDoor = s.kind === "door";
+                    const text = formatCm(s.length);
                     return (
                       <Text
                         key={`${s.id}-label`}
                         x={mid.x + perp.x * offset}
                         y={mid.y + perp.y * offset}
-                        text={formatCm(s.length)}
+                        text={text}
                         fontSize={DIM_FONT_SIZE_SMALL}
                         fontFamily="ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace"
                         fill={isDoor ? "#1c1b1a" : "#78716c"}
                         padding={isDoor ? 2 / DEFAULT_SCALE : 0}
-                        align="center"
-                        offsetX={20 / DEFAULT_SCALE}
+                        offsetX={dimOffsetX(text, DIM_FONT_SIZE_SMALL)}
+                        offsetY={DIM_FONT_SIZE_SMALL / 2}
                         listening={isDoor}
                         onClick={isDoor ? () => openDoorWidthEditor(s) : undefined}
                         onTap={isDoor ? () => openDoorWidthEditor(s) : undefined}
