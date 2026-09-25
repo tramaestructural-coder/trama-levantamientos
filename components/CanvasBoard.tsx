@@ -388,13 +388,80 @@ function applyDeleteSelection(board: BoardState, sel: LassoSelection): BoardStat
   };
 }
 
-type Tool = "line" | "curve" | "stretch" | "select" | "rect" | "ellipse" | "note" | "text" | "eraser" | "pan" | "area" | "ruler" | "lasso" | "scale" | "move";
+function angleOf(anchor: Point, p: Point): number {
+  return Math.atan2(p.y - anchor.y, p.x - anchor.x);
+}
+
+function rotatePointAround(anchor: Point, p: Point, angleDelta: number): Point {
+  const cos = Math.cos(angleDelta);
+  const sin = Math.sin(angleDelta);
+  const dx = p.x - anchor.x;
+  const dy = p.y - anchor.y;
+  return { x: anchor.x + dx * cos - dy * sin, y: anchor.y + dx * sin + dy * cos };
+}
+
+// Rotates every element in `snapshot` by `angleDelta` radians around
+// `anchor` (world coords). A door/window also turns about its own axis
+// (its `angle` field), not just its anchor point — same reasoning as
+// applyGroupScale's length/depth scaling. Ellipses and texts don't have
+// their own axis in this app's data model beyond a plain rotation field,
+// so they just spin in place around it (rx/ry and font size untouched).
+function applyGroupRotate(board: BoardState, snapshot: SelectionSnapshot, anchor: Point, angleDelta: number): BoardState {
+  const angleDeltaDeg = (angleDelta * 180) / Math.PI;
+  return {
+    ...board,
+    lines: board.lines.map((l) => {
+      const orig = snapshot.lines.get(l.id);
+      if (!orig) return l;
+      const p1 = rotatePointAround(anchor, { x: orig.x1, y: orig.y1 }, angleDelta);
+      const p2 = rotatePointAround(anchor, { x: orig.x2, y: orig.y2 }, angleDelta);
+      const mid = rotatePointAround(anchor, orig.mid, angleDelta);
+      return { ...l, x1: p1.x, y1: p1.y, x2: p2.x, y2: p2.y, mid };
+    }),
+    areas: board.areas.map((a) => {
+      const orig = snapshot.areas.get(a.id);
+      if (!orig) return a;
+      return { ...a, points: orig.points.map((p) => rotatePointAround(anchor, p, angleDelta)) };
+    }),
+    symbols: board.symbols.map((s) => {
+      const orig = snapshot.symbols.get(s.id);
+      if (!orig) return s;
+      const p = rotatePointAround(anchor, { x: orig.x, y: orig.y }, angleDelta);
+      return { ...s, x: p.x, y: p.y, angle: orig.angle + angleDelta };
+    }),
+    ellipses: board.ellipses.map((el) => {
+      const orig = snapshot.ellipses.get(el.id);
+      if (!orig) return el;
+      const p = rotatePointAround(anchor, { x: orig.cx, y: orig.cy }, angleDelta);
+      return { ...el, cx: p.x, cy: p.y, rotation: (orig.rotation ?? 0) + angleDeltaDeg };
+    }),
+    texts: board.texts.map((t) => {
+      const orig = snapshot.texts.get(t.id);
+      if (!orig) return t;
+      const p = rotatePointAround(anchor, { x: orig.x, y: orig.y }, angleDelta);
+      return { ...t, x: p.x, y: p.y, rotation: (orig.rotation ?? 0) + angleDeltaDeg };
+    }),
+    notes: board.notes.map((n) => {
+      const orig = snapshot.notes.get(n.id);
+      if (!orig) return n;
+      const points: number[] = [];
+      for (let i = 0; i < orig.points.length; i += 2) {
+        const rp = rotatePointAround(anchor, { x: orig.points[i], y: orig.points[i + 1] }, angleDelta);
+        points.push(rp.x, rp.y);
+      }
+      return { ...n, points };
+    }),
+    updatedAt: Date.now(),
+  };
+}
+
+type Tool = "line" | "curve" | "stretch" | "select" | "rect" | "ellipse" | "note" | "text" | "eraser" | "pan" | "area" | "ruler" | "lasso" | "scale" | "move" | "rotate";
 
 // Tools that share ONE selection (lassoSelection): switching between them
-// keeps whatever's selected, since "escalar"/"mover" only make sense as a
-// second step after "selecciona con select o lazo" — everything else
+// keeps whatever's selected, since "escalar"/"mover"/"rotar" only make sense
+// as a second step after "selecciona con select o lazo" — everything else
 // (drawing tools, eraser, pan, ...) clears the selection on entry.
-const SELECTION_TOOLS: readonly Tool[] = ["select", "lasso", "scale", "move"];
+const SELECTION_TOOLS: readonly Tool[] = ["select", "lasso", "scale", "move", "rotate"];
 
 type EditingValue = {
   id: string;
@@ -490,6 +557,9 @@ export default function CanvasBoard({ boardId }: { boardId: string }) {
   // shape either way, just populated by a different gesture.
   const objectPinchRef = useRef<{ selection: LassoSelection; anchor: Point; dist: number; snapshot: SelectionSnapshot } | null>(null);
   const moveOriginRef = useRef<{ selection: LassoSelection; snapshot: SelectionSnapshot; startWorld: Point } | null>(null);
+  // Same idea as objectPinchRef, but tracking a reference ANGLE (from the
+  // anchor to the pointer, or between two touches) instead of a distance.
+  const rotateOriginRef = useRef<{ selection: LassoSelection; anchor: Point; angle0: number; snapshot: SelectionSnapshot } | null>(null);
   const stretchOriginRef = useRef<Point | null>(null);
   const stretchDragStartRef = useRef<Point | null>(null);
   const stretchConnectionsRef = useRef<{
@@ -548,9 +618,10 @@ export default function CanvasBoard({ boardId }: { boardId: string }) {
     setEraserCursor(null);
     objectPinchRef.current = null;
     moveOriginRef.current = null;
-    // "escalar"/"mover" only exist as a second step after selecting with
-    // "select" or "lazo" — keep the selection when moving between any of
-    // those four tools, drop it for anything else (a new drawing tool,
+    rotateOriginRef.current = null;
+    // "escalar"/"mover"/"rotar" only exist as a second step after selecting
+    // with "select" or "lazo" — keep the selection when moving between any
+    // of those tools, drop it for anything else (a new drawing tool,
     // eraser, pan, ...).
     if (!SELECTION_TOOLS.includes(t)) setLassoSelection(null);
     setToolRaw(t);
@@ -835,6 +906,21 @@ export default function CanvasBoard({ boardId }: { boardId: string }) {
           snapshot: snapshotSelection(boardRef.current, lassoSelection),
           startWorld: world,
         };
+      } else if (tool === "rotate" && lassoSelection && !lassoSelectionIsEmpty(lassoSelection)) {
+        // 1-finger/mouse version: the angle from the selection's own center
+        // to the pointer, tracked the same way the 2-finger twist tracks the
+        // angle between the two touches (see handleTouchMove).
+        const bbox = computeSelectionBBox(boardRef.current, lassoSelection);
+        if (bbox) {
+          const anchor = { x: (bbox.minX + bbox.maxX) / 2, y: (bbox.minY + bbox.maxY) / 2 };
+          pushHistory();
+          rotateOriginRef.current = {
+            selection: lassoSelection,
+            anchor,
+            angle0: angleOf(anchor, world),
+            snapshot: snapshotSelection(boardRef.current, lassoSelection),
+          };
+        }
       }
     },
     [tool, areaMode, scale, pos, toWorld, allEndpoints, board.lines, gridStep, finalizeArea, lassoSelection, pushHistory]
@@ -891,6 +977,10 @@ export default function CanvasBoard({ boardId }: { boardId: string }) {
       const g = moveOriginRef.current;
       const delta = { x: world.x - g.startWorld.x, y: world.y - g.startWorld.y };
       setBoard((b) => applyGroupTranslate(b, g.snapshot, delta));
+    } else if (tool === "rotate" && rotateOriginRef.current) {
+      const g = rotateOriginRef.current;
+      const angleDelta = angleOf(g.anchor, world) - g.angle0;
+      setBoard((b) => applyGroupRotate(b, g.snapshot, g.anchor, angleDelta));
     }
 
     if (tool === "eraser") setEraserCursor(world);
@@ -980,6 +1070,8 @@ export default function CanvasBoard({ boardId }: { boardId: string }) {
       objectPinchRef.current = null;
     } else if (tool === "move") {
       moveOriginRef.current = null;
+    } else if (tool === "rotate") {
+      rotateOriginRef.current = null;
     }
   }, [tool, drawingLine, drawingBox, drawingNote, lassoPoints, color, scale, pos, toWorld, pushHistory]);
 
@@ -1833,13 +1925,19 @@ export default function CanvasBoard({ boardId }: { boardId: string }) {
       const dist = touchDistance(p1, p2);
       const center = touchCenter(p1, p2);
 
-      // A pinch already in progress keeps doing whatever it started as —
-      // scaling the lasso selection / a text label, or zooming the canvas —
-      // regardless of how the finger center drifts afterward.
+      // A pinch/twist already in progress keeps doing whatever it started
+      // as — scaling or rotating the lasso selection, or zooming the
+      // canvas — regardless of how the fingers drift afterward.
       if (objectPinchRef.current) {
         const g = objectPinchRef.current;
         const k = clamp(dist / g.dist, PINCH_SCALE_MIN, PINCH_SCALE_MAX);
         setBoard((b) => applyGroupScale(b, g.snapshot, g.anchor, k));
+        return;
+      }
+      if (rotateOriginRef.current) {
+        const g = rotateOriginRef.current;
+        const angleDelta = angleOf(p1, p2) - g.angle0;
+        setBoard((b) => applyGroupRotate(b, g.snapshot, g.anchor, angleDelta));
         return;
       }
       if (pinchRef.current) {
@@ -1858,10 +1956,10 @@ export default function CanvasBoard({ boardId }: { boardId: string }) {
         return;
       }
 
-      // First frame of a fresh 2-finger gesture. In the "escalar" tool, with
-      // something selected, it's always a scale gesture — no hit-testing:
-      // you already told the app what to scale by selecting it. Otherwise
-      // it's the default: zoom the whole canvas.
+      // First frame of a fresh 2-finger gesture. In the "escalar"/"rotar"
+      // tools, with something selected, it's always that gesture — no
+      // hit-testing: you already told the app what to affect by selecting
+      // it. Otherwise it's the default: zoom the whole canvas.
       setDrawingLine(null);
       setDrawingNote(null);
       setLassoPoints(null);
@@ -1881,6 +1979,21 @@ export default function CanvasBoard({ boardId }: { boardId: string }) {
         }
       }
 
+      if (tool === "rotate" && lassoSelection && !lassoSelectionIsEmpty(lassoSelection)) {
+        const board = boardRef.current;
+        const bbox = computeSelectionBBox(board, lassoSelection);
+        if (bbox) {
+          pushHistory();
+          rotateOriginRef.current = {
+            selection: lassoSelection,
+            anchor: { x: (bbox.minX + bbox.maxX) / 2, y: (bbox.minY + bbox.maxY) / 2 },
+            angle0: angleOf(p1, p2),
+            snapshot: snapshotSelection(board, lassoSelection),
+          };
+          return;
+        }
+      }
+
       pinchRef.current = { dist, center, scale, pos };
     },
     [tool, scale, pos, clampPos, lassoSelection, pushHistory]
@@ -1890,6 +2003,7 @@ export default function CanvasBoard({ boardId }: { boardId: string }) {
     if (e.evt.touches.length < 2) {
       pinchRef.current = null;
       objectPinchRef.current = null;
+      rotateOriginRef.current = null;
     }
   }, []);
 
@@ -2278,6 +2392,7 @@ export default function CanvasBoard({ boardId }: { boardId: string }) {
                     y={el.cy}
                     radiusX={el.rx}
                     radiusY={el.ry}
+                    rotation={el.rotation ?? 0}
                     stroke={el.color}
                     strokeWidth={2 / scale}
                     hitStrokeWidth={16 / scale}
@@ -2812,6 +2927,7 @@ export default function CanvasBoard({ boardId }: { boardId: string }) {
                     y={t.y}
                     text={t.text}
                     fontSize={t.fontSize ?? DEFAULT_TEXT_FONT_SIZE}
+                    rotation={t.rotation ?? 0}
                     fontFamily="ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace"
                     fill={t.color}
                     padding={2 / DEFAULT_SCALE}

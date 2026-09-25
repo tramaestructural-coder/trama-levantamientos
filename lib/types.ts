@@ -59,6 +59,8 @@ export type EllipseZone = {
   rx: number;
   ry: number;
   color: LineColor;
+  // Degrees, matching Konva's own rotation prop — undefined/0 is axis-aligned.
+  rotation?: number;
 };
 
 export type TextLabel = {
@@ -71,6 +73,8 @@ export type TextLabel = {
   // back to the original fixed screen size for texts placed before this was
   // adjustable. Set by pinching the label with two fingers.
   fontSize?: number;
+  // Degrees, matching Konva's own rotation prop — undefined/0 is upright.
+  rotation?: number;
 };
 
 // A reference plan (photo/scan) traced under the drawing. Position/size are

@@ -4,7 +4,7 @@ import { useEffect, useState } from "react";
 import Link from "next/link";
 import { PEN_COLORS, type LineColor } from "@/lib/types";
 
-type Tool = "line" | "curve" | "stretch" | "select" | "rect" | "ellipse" | "note" | "text" | "eraser" | "pan" | "area" | "ruler" | "lasso" | "scale" | "move";
+type Tool = "line" | "curve" | "stretch" | "select" | "rect" | "ellipse" | "note" | "text" | "eraser" | "pan" | "area" | "ruler" | "lasso" | "scale" | "move" | "rotate";
 
 const COLOR_NAMES: Record<LineColor, string> = {
   "#1c1b1a": "Negro",
@@ -127,6 +127,19 @@ function IconScale() {
         strokeLinecap="round"
         strokeLinejoin="round"
       />
+    </svg>
+  );
+}
+function IconRotate() {
+  return (
+    <svg width="18" height="18" viewBox="0 0 18 18" fill="none">
+      <path
+        d="M14.5 9A5.5 5.5 0 1 1 12 4.4"
+        stroke="currentColor"
+        strokeWidth="1.6"
+        strokeLinecap="round"
+      />
+      <path d="M12 2.2l0.3 2.6-2.6 0.5" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" />
     </svg>
   );
 }
@@ -532,6 +545,9 @@ export default function Toolbar({
             </ToolButton>
             <ToolButton active={tool === "move"} onClick={() => setTool("move")} label="Mover la selección (arrastrá)">
               <IconMove />
+            </ToolButton>
+            <ToolButton active={tool === "rotate"} onClick={() => setTool("rotate")} label="Rotar la selección (arrastrá o girá con dos dedos)">
+              <IconRotate />
             </ToolButton>
           </div>
           <div className="flex items-center gap-1">
