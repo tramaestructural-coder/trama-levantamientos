@@ -3,15 +3,28 @@ import type { BoardMeta, BoardState } from "./types";
 
 const DB_NAME = "trama-levantamientos";
 const STORE = "boards";
+const PDF_STORE = "pdfs";
+
+export type PdfExportMeta = {
+  id: string;
+  boardId: string;
+  boardName: string;
+  createdAt: number;
+};
+
+export type PdfExport = PdfExportMeta & { blob: Blob };
 
 let dbPromise: Promise<IDBPDatabase> | null = null;
 
 function getDb() {
   if (!dbPromise) {
-    dbPromise = openDB(DB_NAME, 1, {
+    dbPromise = openDB(DB_NAME, 2, {
       upgrade(db) {
         if (!db.objectStoreNames.contains(STORE)) {
           db.createObjectStore(STORE);
+        }
+        if (!db.objectStoreNames.contains(PDF_STORE)) {
+          db.createObjectStore(PDF_STORE);
         }
       },
     });
@@ -47,4 +60,27 @@ export async function saveBoard(board: BoardState): Promise<void> {
 export async function deleteBoard(id: string): Promise<void> {
   const db = await getDb();
   await db.delete(STORE, id);
+}
+
+export async function savePdfExport(record: PdfExport): Promise<void> {
+  const db = await getDb();
+  await db.put(PDF_STORE, record, record.id);
+}
+
+export async function listPdfExports(): Promise<PdfExportMeta[]> {
+  const db = await getDb();
+  const all: PdfExport[] = await db.getAll(PDF_STORE);
+  return all
+    .map(({ id, boardId, boardName, createdAt }) => ({ id, boardId, boardName, createdAt }))
+    .sort((a, b) => b.createdAt - a.createdAt);
+}
+
+export async function getPdfExport(id: string): Promise<PdfExport | undefined> {
+  const db = await getDb();
+  return db.get(PDF_STORE, id);
+}
+
+export async function deletePdfExport(id: string): Promise<void> {
+  const db = await getDb();
+  await db.delete(PDF_STORE, id);
 }

@@ -2,25 +2,40 @@
 
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
-import { Stage, Layer, Line, Circle, Text, Rect, Ellipse, Shape, Group } from "react-konva";
+import { Stage, Layer, Line, Circle, Text, Rect, Ellipse, Shape, Group, Image as KonvaImage } from "react-konva";
 import type Konva from "konva";
 import type { KonvaEventObject } from "konva/lib/Node";
 import { jsPDF } from "jspdf";
 import {
   clamp,
   distance,
+  findAxisAlignment,
+  findPerpendicularSnap,
   findSnapPoint,
+  findWallAlignment,
   makeId,
   polygonArea,
   projectOntoSegment,
+  resizeEndpointTarget,
   samePoint,
+  sampleCurvePoints,
   snapToAxis,
   snapToGrid,
+  type AxisGuide,
   type Point,
 } from "@/lib/geometry";
 import { touchCenter, touchDistance } from "@/lib/pinch";
-import { getBoard, saveBoard } from "@/lib/storage";
-import { doorGeometry, makeEllipseLines, makeRectLines, newDoor, newWindow, windowGeometry } from "@/lib/symbols";
+import { getBoard, saveBoard, savePdfExport } from "@/lib/storage";
+import {
+  doorGeometry,
+  DOOR_DEFAULT_FRAME_DEPTH,
+  makeRectLines,
+  newDoor,
+  newWindow,
+  WINDOW_CORNERS,
+  WINDOW_DEFAULT_DEPTH,
+  windowGeometry,
+} from "@/lib/symbols";
 import {
   emptyBoard,
   moveLineEndpoint,
@@ -29,9 +44,11 @@ import {
   resizeLineToValue,
   type AreaZone,
   type BoardState,
+  type EllipseZone,
   type LineColor,
   type MeasureLine,
   type SymbolInstance,
+  type TextLabel,
 } from "@/lib/types";
 import Toolbar from "./Toolbar";
 import LayersPanel from "./LayersPanel";
@@ -47,12 +64,14 @@ const SNAP_PX = 16; // vertex magnet radius, screen px
 const GRID_SNAP_PX = 10; // grid magnet radius, screen px — lighter than the vertex snap
 const FINE_GRID_STEP = 0.5; // meters
 const FINE_GRID_MIN_SCALE = 70; // px per meter — below this the 50cm grid is too dense to show
+const ULTRA_FINE_GRID_STEP = 0.1; // meters
+const ULTRA_FINE_GRID_MIN_SCALE = 150; // px per meter — below this the 10cm grid is too dense to show
 const LABEL_MIN_SCALE = 15; // px per meter — below this, value labels hide to avoid crossing lines
 const TAP_THRESHOLD_PX = 8;
 const HISTORY_LIMIT = 50;
 const WALL_ALIGN_DIST = 0.5; // meters — how close a door/window has to get to a wall to snap onto it
 
-type Tool = "line" | "curve" | "stretch" | "select" | "rect" | "ellipse" | "note" | "eraser" | "pan" | "area";
+type Tool = "line" | "curve" | "stretch" | "select" | "rect" | "ellipse" | "note" | "text" | "eraser" | "pan" | "area" | "ruler";
 
 type EditingValue = {
   id: string;
@@ -75,12 +94,32 @@ function hasDraggableAncestor(node: Konva.Node): boolean {
   return false;
 }
 
-function findOrthoAnchor(origin: Point, lines: MeasureLine[]): Point | null {
-  for (const l of lines) {
-    if (samePoint({ x: l.x1, y: l.y1 }, origin, 0.03)) return { x: l.x2, y: l.y2 };
-    if (samePoint({ x: l.x2, y: l.y2 }, origin, 0.03)) return { x: l.x1, y: l.y1 };
-  }
-  return null;
+// Every point a new line/area/symbol can snap onto: line endpoints plus each
+// line's own (possibly curved) midpoint — without the midpoint, a curved
+// wall's bend can't be used as an area corner.
+function useHtmlImage(src: string | undefined): HTMLImageElement | null {
+  const [img, setImg] = useState<HTMLImageElement | null>(null);
+  useEffect(() => {
+    if (!src) {
+      setImg(null);
+      return;
+    }
+    const image = new window.Image();
+    image.onload = () => setImg(image);
+    image.src = src;
+    return () => {
+      image.onload = null;
+    };
+  }, [src]);
+  return img;
+}
+
+function allSnapPoints(lines: MeasureLine[]): Point[] {
+  const pts: Point[] = [];
+  lines.forEach((l) => {
+    pts.push({ x: l.x1, y: l.y1 }, { x: l.x2, y: l.y2 }, { x: l.mid.x, y: l.mid.y });
+  });
+  return pts;
 }
 
 export default function CanvasBoard({ boardId }: { boardId: string }) {
@@ -93,6 +132,7 @@ export default function CanvasBoard({ boardId }: { boardId: string }) {
   const [panelOpen, setPanelOpen] = useState(false);
   const [favoritesOpen, setFavoritesOpen] = useState(false);
   const [selectedLineId, setSelectedLineId] = useState<string | null>(null);
+  const [showDimensions, setShowDimensions] = useState(true);
 
   const [history, setHistory] = useState<BoardState[]>([]);
   const [future, setFuture] = useState<BoardState[]>([]);
@@ -102,16 +142,26 @@ export default function CanvasBoard({ boardId }: { boardId: string }) {
   const [stageSize, setStageSize] = useState({ width: 0, height: 0 });
 
   const [drawingLine, setDrawingLine] = useState<{ start: Point; end: Point } | null>(null);
+  const [lineAlignGuides, setLineAlignGuides] = useState<AxisGuide[] | null>(null);
   const [drawingNote, setDrawingNote] = useState<number[] | null>(null);
   const [drawingArea, setDrawingArea] = useState<Point[] | null>(null);
+  const [areaMode, setAreaMode] = useState<"puntos" | "lineas">("puntos");
+  const [drawingAreaChain, setDrawingAreaChain] = useState<Point[] | null>(null);
+  const [ruler, setRuler] = useState<{ start: Point; end: Point | null; hover: Point | null } | null>(null);
   const [drawingBox, setDrawingBox] = useState<{ start: Point; end: Point } | null>(null);
   const [editingValue, setEditingValue] = useState<EditingValue | null>(null);
+  const [editingText, setEditingText] = useState<{ id: string | null; screenX: number; screenY: number; x: number; y: number; value: string } | null>(
+    null
+  );
+  const [editingDoorWidth, setEditingDoorWidth] = useState<{ id: string; screenX: number; screenY: number; value: string } | null>(null);
+  const [doorHingeReadout, setDoorHingeReadout] = useState<{ x: number; y: number; text: string } | null>(null);
 
   const stageRef = useRef<Konva.Stage>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const hasFitRef = useRef(false);
   const pinchRef = useRef<{ dist: number; center: Point; scale: number; pos: Point } | null>(null);
   const stretchOriginRef = useRef<Point | null>(null);
+  const stretchDragStartRef = useRef<Point | null>(null);
   const stretchConnectionsRef = useRef<{
     lines: { id: string; matchStart: boolean; matchEnd: boolean }[];
     areas: { id: string; pointIndex: number }[];
@@ -121,20 +171,48 @@ export default function CanvasBoard({ boardId }: { boardId: string }) {
     { id: string; matchStart: boolean; matchEnd: boolean; end: "start" | "end" }[]
   >([]);
   const lineDragAreaConnectionsRef = useRef<{ id: string; pointIndex: number; end: "start" | "end" }[]>([]);
-  const symbolDragOriginRef = useRef<{ x: number; y: number; angle: number } | null>(null);
+  const lineDragGroupOriginRef = useRef<{ id: string; x1: number; y1: number; x2: number; y2: number; mid: Point }[]>([]);
+  const symbolDragOriginRef = useRef<{ x: number; y: number; angle: number; length: number } | null>(null);
   const doorResizeOriginRef = useRef<{ id: string } | null>(null);
-  const windowResizeOriginRef = useRef<{ id: string; end: "p1" | "p2"; fixedPoint: Point } | null>(null);
+  const doorFrameResizeOriginRef = useRef<{ id: string } | null>(null);
+  const windowResizeOriginRef = useRef<{
+    id: string;
+    cornerIndex: number;
+    startCorner: Point;
+    lengthFixed: Point;
+    depthFixed: Point;
+    dir: Point;
+    perp: Point;
+    angle: number;
+    length: number;
+    depth: number;
+  } | null>(null);
+  const ellipseDragOriginRef = useRef<{ cx: number; cy: number } | null>(null);
+  const ellipseResizeOriginRef = useRef<{ id: string } | null>(null);
+  const textDragOriginRef = useRef<{ id: string; x: number; y: number } | null>(null);
+  const backgroundDragOriginRef = useRef<{ x: number; y: number } | null>(null);
+  const backgroundResizeOriginRef = useRef<{ x: number; y: number; width: number; height: number; aspect: number } | null>(
+    null
+  );
   const boardRef = useRef(board);
 
   useEffect(() => {
     boardRef.current = board;
   }, [board]);
 
+  const backgroundImage = useHtmlImage(board.background?.dataUrl);
+
   const setTool = useCallback((t: Tool) => {
     setDrawingArea(null);
+    setDrawingAreaChain(null);
     setDrawingBox(null);
     setSelectedLineId(null);
     setFavoritesOpen(false);
+    setEditingText(null);
+    setEditingDoorWidth(null);
+    setDoorHingeReadout(null);
+    setLineAlignGuides(null);
+    setRuler(null);
     setToolRaw(t);
   }, []);
 
@@ -190,8 +268,12 @@ export default function CanvasBoard({ boardId }: { boardId: string }) {
     let cancelled = false;
     getBoard(boardId).then((saved) => {
       if (cancelled) return;
-      // Older saved boards may predate the `symbols` field.
-      setBoard(saved ? { ...saved, symbols: saved.symbols ?? [] } : emptyBoard(boardId));
+      // Older saved boards may predate the symbols/ellipses/texts fields.
+      setBoard(
+        saved
+          ? { ...saved, symbols: saved.symbols ?? [], ellipses: saved.ellipses ?? [], texts: saved.texts ?? [] }
+          : emptyBoard(boardId)
+      );
       setLoaded(true);
       setHistory([]);
       setFuture([]);
@@ -276,8 +358,9 @@ export default function CanvasBoard({ boardId }: { boardId: string }) {
   }, [board.lines]);
 
   // Snap to whatever grid resolution is currently visible: whole meters when
-  // zoomed out, 50cm once the finer grid fades in.
-  const gridStep = scale >= FINE_GRID_MIN_SCALE ? FINE_GRID_STEP : 1;
+  // zoomed out, 50cm once the finer grid fades in, 10cm once zoomed in further still.
+  const gridStep =
+    scale >= ULTRA_FINE_GRID_MIN_SCALE ? ULTRA_FINE_GRID_STEP : scale >= FINE_GRID_MIN_SCALE ? FINE_GRID_STEP : 1;
 
   // --- pointer drawing -------------------------------------------------------
 
@@ -293,6 +376,41 @@ export default function CanvasBoard({ boardId }: { boardId: string }) {
       }));
     },
     [color, pushHistory]
+  );
+
+  // "Líneas" area mode: tap a wall in order instead of tapping vertices —
+  // each line's own curve gets sampled into the chain so a curved wall
+  // becomes the area's actual boundary instead of a straight approximation
+  // through its midpoint (what tapping just its 3 snap points would give).
+  const handleAreaLineClick = useCallback(
+    (line: MeasureLine) => {
+      const threshold = SNAP_PX / scale;
+      const p1 = { x: line.x1, y: line.y1 };
+      const p2 = { x: line.x2, y: line.y2 };
+      const isCurved = !samePoint(line.mid, { x: (p1.x + p2.x) / 2, y: (p1.y + p2.y) / 2 }, 0.03);
+
+      setDrawingAreaChain((prev) => {
+        let chain: Point[];
+        if (!prev || prev.length === 0) {
+          chain = isCurved ? [p1, ...sampleCurvePoints(p1, line.mid, p2, 16)] : [p1, p2];
+        } else {
+          const last = prev[prev.length - 1];
+          if (samePoint(last, p1, threshold)) {
+            chain = [...prev, ...(isCurved ? sampleCurvePoints(p1, line.mid, p2, 16) : [p2])];
+          } else if (samePoint(last, p2, threshold)) {
+            chain = [...prev, ...(isCurved ? sampleCurvePoints(p2, line.mid, p1, 16) : [p1])];
+          } else {
+            return prev; // this wall doesn't connect to the chain's open end
+          }
+        }
+        if (chain.length >= 4 && samePoint(chain[chain.length - 1], chain[0], threshold)) {
+          finalizeArea(chain.slice(0, -1));
+          return null;
+        }
+        return chain;
+      });
+    },
+    [scale, finalizeArea]
   );
 
   const handlePointerDown = useCallback(
@@ -326,9 +444,9 @@ export default function CanvasBoard({ boardId }: { boardId: string }) {
         setDrawingBox({ start: snapped, end: snapped });
       } else if (tool === "note") {
         setDrawingNote([world.x, world.y]);
-      } else if (tool === "area") {
+      } else if (tool === "area" && areaMode === "puntos") {
         const threshold = SNAP_PX / scale;
-        const snapped = findSnapPoint(world, allEndpoints(), threshold);
+        const snapped = findSnapPoint(world, allSnapPoints(board.lines), threshold);
         if (!snapped) return;
         setDrawingArea((prev) => {
           const pts = prev ?? [];
@@ -341,9 +459,16 @@ export default function CanvasBoard({ boardId }: { boardId: string }) {
         });
       } else if (tool === "select") {
         setSelectedLineId(null);
+      } else if (tool === "ruler") {
+        const threshold = SNAP_PX / scale;
+        const snapped =
+          findSnapPoint(world, allSnapPoints(board.lines), threshold) ??
+          snapToGrid(world, GRID_SNAP_PX / scale, gridStep) ??
+          world;
+        setRuler((prev) => (!prev || prev.end ? { start: snapped, end: null, hover: null } : { start: prev.start, end: snapped, hover: null }));
       }
     },
-    [tool, scale, toWorld, allEndpoints, gridStep, finalizeArea]
+    [tool, areaMode, scale, toWorld, allEndpoints, board.lines, gridStep, finalizeArea]
   );
 
   const handlePointerMove = useCallback(() => {
@@ -357,9 +482,12 @@ export default function CanvasBoard({ boardId }: { boardId: string }) {
       const threshold = SNAP_PX / scale;
       const candidates = allEndpoints().filter((p) => !samePoint(p, drawingLine.start));
       const vertexSnap = findSnapPoint(world, candidates, threshold);
-      let end = vertexSnap ?? snapToGrid(world, GRID_SNAP_PX / scale, gridStep) ?? world;
+      const perpSnap = vertexSnap ? null : findPerpendicularSnap(drawingLine.start, world, board.lines, threshold);
+      const alignResult = !vertexSnap && !perpSnap && !ortho ? findAxisAlignment(world, candidates, threshold) : null;
+      let end = vertexSnap ?? perpSnap ?? alignResult?.point ?? snapToGrid(world, GRID_SNAP_PX / scale, gridStep) ?? world;
       if (ortho) end = snapToAxis(drawingLine.start, end);
       setDrawingLine({ start: drawingLine.start, end });
+      setLineAlignGuides(alignResult?.guides ?? null);
     } else if ((tool === "rect" || tool === "ellipse") && drawingBox) {
       const threshold = SNAP_PX / scale;
       const candidates = allEndpoints().filter((p) => !samePoint(p, drawingBox.start));
@@ -377,12 +505,19 @@ export default function CanvasBoard({ boardId }: { boardId: string }) {
       setDrawingBox({ start: drawingBox.start, end });
     } else if (tool === "note" && drawingNote) {
       setDrawingNote([...drawingNote, world.x, world.y]);
+    } else if (tool === "ruler" && ruler && !ruler.end) {
+      const threshold = SNAP_PX / scale;
+      const vertexSnap = findSnapPoint(world, allSnapPoints(board.lines), threshold);
+      let hover = vertexSnap ?? snapToGrid(world, GRID_SNAP_PX / scale, gridStep) ?? world;
+      if (ortho) hover = snapToAxis(ruler.start, hover);
+      setRuler({ start: ruler.start, end: null, hover });
     }
-  }, [tool, drawingLine, drawingBox, drawingNote, ortho, scale, toWorld, allEndpoints, gridStep]);
+  }, [tool, drawingLine, drawingBox, drawingNote, ruler, ortho, scale, toWorld, allEndpoints, board.lines, gridStep]);
 
   const handlePointerUp = useCallback(() => {
     if (tool === "line" && drawingLine) {
       const { start, end } = drawingLine;
+      setLineAlignGuides(null);
       if (distance(start, end) * scale < TAP_THRESHOLD_PX) {
         setDrawingLine(null);
         return;
@@ -406,15 +541,29 @@ export default function CanvasBoard({ boardId }: { boardId: string }) {
       };
       setBoard((b) => ({ ...b, lines: [...b.lines, newLine], updatedAt: Date.now() }));
       setDrawingLine(null);
-    } else if ((tool === "rect" || tool === "ellipse") && drawingBox) {
+    } else if (tool === "rect" && drawingBox) {
       const { start, end } = drawingBox;
       if (distance(start, end) * scale < TAP_THRESHOLD_PX) {
         setDrawingBox(null);
         return;
       }
       pushHistory();
-      const newLines = tool === "rect" ? makeRectLines(start, end, color) : makeEllipseLines(start, end, color);
+      const newLines = makeRectLines(start, end, color);
       setBoard((b) => ({ ...b, lines: [...b.lines, ...newLines], updatedAt: Date.now() }));
+      setDrawingBox(null);
+    } else if (tool === "ellipse" && drawingBox) {
+      const { start, end } = drawingBox;
+      if (distance(start, end) * scale < TAP_THRESHOLD_PX) {
+        setDrawingBox(null);
+        return;
+      }
+      pushHistory();
+      const cx = (start.x + end.x) / 2;
+      const cy = (start.y + end.y) / 2;
+      const rx = Math.abs(end.x - start.x) / 2;
+      const ry = Math.abs(end.y - start.y) / 2;
+      const ellipse: EllipseZone = { id: makeId("e"), cx, cy, rx, ry, color };
+      setBoard((b) => ({ ...b, ellipses: [...b.ellipses, ellipse], updatedAt: Date.now() }));
       setDrawingBox(null);
     } else if (tool === "note" && drawingNote) {
       if (drawingNote.length >= 4) {
@@ -427,29 +576,58 @@ export default function CanvasBoard({ boardId }: { boardId: string }) {
         }));
       }
       setDrawingNote(null);
+    } else if (tool === "text") {
+      // Opened on pointer-up (not down): opening it on mousedown left the
+      // trailing native mouseup/click still headed for the canvas, which
+      // stole focus back from the freshly-mounted autoFocus input and
+      // fired its onBlur (closing it) a moment after it appeared.
+      const stage = stageRef.current;
+      const pointer = stage?.getPointerPosition();
+      if (pointer) {
+        const world = toWorld(pointer);
+        const screen = { x: world.x * scale + pos.x, y: world.y * scale + pos.y };
+        setEditingText({ id: null, screenX: screen.x, screenY: screen.y, x: world.x, y: world.y, value: "" });
+      }
     }
-  }, [tool, drawingLine, drawingBox, drawingNote, color, scale, pushHistory]);
+  }, [tool, drawingLine, drawingBox, drawingNote, color, scale, pos, toWorld, pushHistory]);
 
   const handleEraseShape = useCallback(
-    (id: string, kind: "measure" | "note" | "area" | "symbol") => {
+    (id: string, kind: "measure" | "note" | "area" | "symbol" | "ellipse" | "text") => {
       if (tool !== "eraser") return;
       pushHistory();
-      setBoard((b) => ({
-        ...b,
-        lines: kind === "measure" ? b.lines.filter((l) => l.id !== id) : b.lines,
-        notes: kind === "note" ? b.notes.filter((n) => n.id !== id) : b.notes,
-        areas: kind === "area" ? b.areas.filter((a) => a.id !== id) : b.areas,
-        symbols: kind === "symbol" ? b.symbols.filter((s) => s.id !== id) : b.symbols,
-        updatedAt: Date.now(),
-      }));
+      setBoard((b) => {
+        let lines = b.lines;
+        if (kind === "measure") {
+          // Erasing one edge of a rectangle breaks the group — the rest
+          // fall back to independent lines instead of staying rigidly
+          // linked to an edge that no longer exists.
+          const erased = b.lines.find((l) => l.id === id);
+          lines = b.lines
+            .filter((l) => l.id !== id)
+            .map((l) => (erased?.groupId && l.groupId === erased.groupId ? { ...l, groupId: undefined } : l));
+        }
+        return {
+          ...b,
+          lines,
+          notes: kind === "note" ? b.notes.filter((n) => n.id !== id) : b.notes,
+          areas: kind === "area" ? b.areas.filter((a) => a.id !== id) : b.areas,
+          symbols: kind === "symbol" ? b.symbols.filter((s) => s.id !== id) : b.symbols,
+          ellipses: kind === "ellipse" ? b.ellipses.filter((e) => e.id !== id) : b.ellipses,
+          texts: kind === "text" ? b.texts.filter((t) => t.id !== id) : b.texts,
+          updatedAt: Date.now(),
+        };
+      });
     },
     [tool, pushHistory]
   );
 
   const openValueEditor = useCallback(
-    (line: MeasureLine) => {
-      if (tool === "eraser" || tool === "pan" || tool === "area" || tool === "curve" || tool === "stretch" || tool === "select")
-        return;
+    // `fromLabel`: tapping the value label itself is always meant to edit
+    // it, whatever tool happens to be active — only tapping the line's
+    // BODY defers to the current tool (erase/select/drag/etc).
+    (line: MeasureLine, fromLabel = false) => {
+      if (tool === "eraser" || tool === "pan") return;
+      if (!fromLabel && (tool === "area" || tool === "curve" || tool === "stretch" || tool === "select" || tool === "text")) return;
       pushHistory();
       const mid = { x: (line.x1 + line.x2) / 2, y: (line.y1 + line.y2) / 2 };
       setEditingValue({
@@ -504,6 +682,212 @@ export default function CanvasBoard({ boardId }: { boardId: string }) {
     [pushHistory]
   );
 
+  // Dragging the curve's mid-point handle also re-measures it live — the
+  // straight-line distance no longer matches once it's bent, so we sum the
+  // two half-chords (start→mid→end) as a close approximation of the arc.
+  const curveMidDragStart = useCallback(() => {
+    pushHistory();
+  }, [pushHistory]);
+
+  const curveMidDragMove = useCallback((line: MeasureLine, e: KonvaEventObject<DragEvent>) => {
+    const p = e.target.position();
+    setBoard((b) => ({
+      ...b,
+      lines: b.lines.map((ln) => {
+        if (ln.id !== line.id) return ln;
+        const len = distance({ x: ln.x1, y: ln.y1 }, p) + distance(p, { x: ln.x2, y: ln.y2 });
+        return { ...ln, mid: { x: p.x, y: p.y }, value: len.toFixed(2) };
+      }),
+      updatedAt: Date.now(),
+    }));
+  }, []);
+
+  // --- texto: a free-standing label you tap to place, tap again to edit -----
+
+  const openTextEditor = useCallback(
+    (t: TextLabel) => {
+      if (tool === "eraser" || tool === "pan") return;
+      setEditingText({ id: t.id, screenX: t.x * scale + pos.x, screenY: t.y * scale + pos.y, x: t.x, y: t.y, value: t.text });
+    },
+    [tool, scale, pos]
+  );
+
+  const commitEditingText = useCallback(() => {
+    if (!editingText) return;
+    const trimmed = editingText.value.trim();
+    if (editingText.id) {
+      pushHistory();
+      const editId = editingText.id;
+      if (trimmed) {
+        setBoard((b) => ({
+          ...b,
+          texts: b.texts.map((t) => (t.id === editId ? { ...t, text: trimmed } : t)),
+          updatedAt: Date.now(),
+        }));
+      } else {
+        setBoard((b) => ({ ...b, texts: b.texts.filter((t) => t.id !== editId), updatedAt: Date.now() }));
+      }
+    } else if (trimmed) {
+      pushHistory();
+      const id = makeId("t");
+      setBoard((b) => ({
+        ...b,
+        texts: [...b.texts, { id, x: editingText.x, y: editingText.y, text: trimmed, color }],
+        updatedAt: Date.now(),
+      }));
+    }
+    setEditingText(null);
+  }, [editingText, pushHistory, color]);
+
+  const cancelEditingText = useCallback(() => setEditingText(null), []);
+
+  const handleTextDragStart = useCallback(
+    (t: TextLabel) => {
+      pushHistory();
+      textDragOriginRef.current = { id: t.id, x: t.x, y: t.y };
+    },
+    [pushHistory]
+  );
+
+  const handleTextDragMove = useCallback((e: KonvaEventObject<DragEvent>) => {
+    const origin = textDragOriginRef.current;
+    if (!origin) return;
+    const raw = e.target.position();
+    setBoard((b) => ({
+      ...b,
+      texts: b.texts.map((t) => (t.id === origin.id ? { ...t, x: raw.x, y: raw.y } : t)),
+      updatedAt: Date.now(),
+    }));
+  }, []);
+
+  const handleTextDragEnd = useCallback(() => {
+    textDragOriginRef.current = null;
+  }, []);
+
+  // --- elipse: native shape (not line-approximated), draggable + resizable --
+
+  const handleEllipseDragStart = useCallback(
+    (ell: EllipseZone) => {
+      pushHistory();
+      ellipseDragOriginRef.current = { cx: ell.cx, cy: ell.cy };
+    },
+    [pushHistory]
+  );
+
+  const handleEllipseDragMove = useCallback((id: string, e: KonvaEventObject<DragEvent>) => {
+    if (!ellipseDragOriginRef.current) return;
+    // The Ellipse node has explicit x/y props (its real cx/cy), so
+    // e.target.position() during a drag already IS the new absolute
+    // position — adding `origin` on top of it (as if it started at 0,0
+    // like a Group) was doubling it and sending the ellipse flying off.
+    const pos = e.target.position();
+    setBoard((b) => ({
+      ...b,
+      ellipses: b.ellipses.map((el) => (el.id === id ? { ...el, cx: pos.x, cy: pos.y } : el)),
+      updatedAt: Date.now(),
+    }));
+  }, []);
+
+  const handleEllipseDragEnd = useCallback(() => {
+    ellipseDragOriginRef.current = null;
+  }, []);
+
+  const handleEllipseResizeStart = useCallback(
+    (ell: EllipseZone) => {
+      pushHistory();
+      ellipseResizeOriginRef.current = { id: ell.id };
+    },
+    [pushHistory]
+  );
+
+  const handleEllipseResizeMove = useCallback(
+    (id: string, e: KonvaEventObject<DragEvent>) => {
+      if (!ellipseResizeOriginRef.current) return;
+      const raw = e.target.position();
+      setBoard((b) => ({
+        ...b,
+        ellipses: b.ellipses.map((el) => {
+          if (el.id !== id) return el;
+          let rx = Math.max(0.1, Math.abs(raw.x - el.cx));
+          let ry = Math.max(0.1, Math.abs(raw.y - el.cy));
+          if (ortho) {
+            const r = Math.max(rx, ry);
+            rx = r;
+            ry = r;
+          }
+          return { ...el, rx, ry };
+        }),
+        updatedAt: Date.now(),
+      }));
+    },
+    [ortho]
+  );
+
+  const handleEllipseResizeEnd = useCallback(() => {
+    ellipseResizeOriginRef.current = null;
+  }, []);
+
+  // --- fondo de referencia: a traced plan dragged/scaled by eye against the
+  // grid, then locked so it stops being grabbed once it's calibrated -------
+
+  const handleBackgroundDragStart = useCallback(() => {
+    if (!board.background || board.background.locked) return;
+    pushHistory();
+    backgroundDragOriginRef.current = { x: board.background.x, y: board.background.y };
+  }, [board.background, pushHistory]);
+
+  const handleBackgroundDragMove = useCallback((e: KonvaEventObject<DragEvent>) => {
+    if (!backgroundDragOriginRef.current) return;
+    const raw = e.target.position();
+    setBoard((b) =>
+      b.background ? { ...b, background: { ...b.background, x: raw.x, y: raw.y }, updatedAt: Date.now() } : b
+    );
+  }, []);
+
+  const handleBackgroundDragEnd = useCallback(() => {
+    backgroundDragOriginRef.current = null;
+  }, []);
+
+  const handleBackgroundResizeStart = useCallback(() => {
+    if (!board.background || board.background.locked) return;
+    pushHistory();
+    const { x, y, width, height } = board.background;
+    backgroundResizeOriginRef.current = { x, y, width, height, aspect: height / width };
+  }, [board.background, pushHistory]);
+
+  const handleBackgroundResizeMove = useCallback((e: KonvaEventObject<DragEvent>) => {
+    const origin = backgroundResizeOriginRef.current;
+    if (!origin) return;
+    const raw = e.target.position();
+    const width = Math.max(0.5, raw.x - origin.x);
+    const height = width * origin.aspect;
+    setBoard((b) =>
+      b.background ? { ...b, background: { ...b.background, width, height }, updatedAt: Date.now() } : b
+    );
+    e.target.position({ x: origin.x + width, y: origin.y + height });
+  }, []);
+
+  const handleBackgroundResizeEnd = useCallback(() => {
+    backgroundResizeOriginRef.current = null;
+  }, []);
+
+  const handleBackgroundOpacity = useCallback((opacity: number) => {
+    setBoard((b) => (b.background ? { ...b, background: { ...b.background, opacity }, updatedAt: Date.now() } : b));
+  }, []);
+
+  const handleBackgroundToggleLock = useCallback(() => {
+    pushHistory();
+    setBoard((b) =>
+      b.background ? { ...b, background: { ...b.background, locked: !b.background.locked }, updatedAt: Date.now() } : b
+    );
+  }, [pushHistory]);
+
+  const handleBackgroundRemove = useCallback(() => {
+    if (!window.confirm("¿Quitar el plano de fondo?")) return;
+    pushHistory();
+    setBoard((b) => ({ ...b, background: undefined, updatedAt: Date.now() }));
+  }, [pushHistory]);
+
   // --- estirar: from a point (a shared vertex) or from a line (translates it,
   // dragging along whatever else is connected at each end) -------------------
 
@@ -511,6 +895,7 @@ export default function CanvasBoard({ boardId }: { boardId: string }) {
     (vertex: Point) => {
       pushHistory();
       stretchOriginRef.current = vertex;
+      stretchDragStartRef.current = vertex;
       // Fix the set of lines/area-points this vertex touches ONCE, by id —
       // re-matching by coordinates on every drag tick is what let a line
       // silently drift off the point mid-drag (float rounding across dozens
@@ -548,10 +933,10 @@ export default function CanvasBoard({ boardId }: { boardId: string }) {
       let snapped = vertexSnap;
       if (!snapped) {
         snapped = snapToGrid(raw, GRID_SNAP_PX / scale, gridStep) ?? raw;
-        if (ortho) {
-          const anchor = findOrthoAnchor(origin, board.lines);
-          if (anchor) snapped = snapToAxis(anchor, snapped);
-        }
+        // Always locked to one axis at a time (X or Y, whichever moved
+        // further from where this drag started) — stretching a point should
+        // never go diagonal, with or without "Guía recta".
+        if (stretchDragStartRef.current) snapped = snapToAxis(stretchDragStartRef.current, snapped);
       }
       e.target.position(snapped);
       const conns = stretchConnectionsRef.current;
@@ -575,11 +960,12 @@ export default function CanvasBoard({ boardId }: { boardId: string }) {
       }));
       stretchOriginRef.current = snapped;
     },
-    [scale, allEndpoints, gridStep, ortho, board.lines]
+    [scale, allEndpoints, gridStep]
   );
 
   const handleStretchDragEnd = useCallback(() => {
     stretchOriginRef.current = null;
+    stretchDragStartRef.current = null;
     stretchConnectionsRef.current = { lines: [], areas: [] };
   }, []);
 
@@ -592,8 +978,22 @@ export default function CanvasBoard({ boardId }: { boardId: string }) {
         mid: { x: line.mid.x, y: line.mid.y },
       };
       const b = boardRef.current;
+      // A rectangle's 4 edges share a groupId — they move as one rigid
+      // shape (captured once here), so the generic shared-endpoint cascade
+      // below only needs to handle OTHER lines touching this one (e.g. a
+      // separate wall that happens to meet a corner).
+      const groupMates = line.groupId ? b.lines.filter((l) => l.id !== line.id && l.groupId === line.groupId) : [];
+      lineDragGroupOriginRef.current = groupMates.map((l) => ({
+        id: l.id,
+        x1: l.x1,
+        y1: l.y1,
+        x2: l.x2,
+        y2: l.y2,
+        mid: { x: l.mid.x, y: l.mid.y },
+      }));
+      const groupIds = new Set(groupMates.map((l) => l.id));
       lineDragConnectionsRef.current = b.lines
-        .filter((l) => l.id !== line.id)
+        .filter((l) => l.id !== line.id && !groupIds.has(l.id))
         .flatMap((l) => {
           const hits: { id: string; matchStart: boolean; matchEnd: boolean; end: "start" | "end" }[] = [];
           const matchStart = samePoint({ x: l.x1, y: l.y1 }, { x: line.x1, y: line.y1 }, 0.03);
@@ -625,21 +1025,39 @@ export default function CanvasBoard({ boardId }: { boardId: string }) {
       const origin = lineDragOriginRef.current;
       if (!origin) return;
       const rawDelta = e.target.position();
-      const provisionalStart = { x: origin.start.x + rawDelta.x, y: origin.start.y + rawDelta.y };
-      const g = snapToGrid(provisionalStart, GRID_SNAP_PX / scale, gridStep);
-      const adj = g ? { x: g.x - provisionalStart.x, y: g.y - provisionalStart.y } : { x: 0, y: 0 };
-      const delta = { x: rawDelta.x + adj.x, y: rawDelta.y + adj.y };
+      // Locked to one axis at a time — the wall can only slide along X or Y,
+      // whichever the drag has moved further along, never diagonally.
+      const axisX = Math.abs(rawDelta.x) >= Math.abs(rawDelta.y);
+      const activeRaw = axisX ? origin.start.x + rawDelta.x : origin.start.y + rawDelta.y;
+      const activeSnapped = Math.round(activeRaw / gridStep) * gridStep;
+      const useSnap = Math.abs(activeSnapped - activeRaw) * scale <= GRID_SNAP_PX;
+      const activeFinal = useSnap ? activeSnapped : activeRaw;
+      const delta = axisX ? { x: activeFinal - origin.start.x, y: 0 } : { x: 0, y: activeFinal - origin.start.y };
       const newStart = { x: origin.start.x + delta.x, y: origin.start.y + delta.y };
       const newEnd = { x: origin.end.x + delta.x, y: origin.end.y + delta.y };
       const newMid = { x: origin.mid.x + delta.x, y: origin.mid.y + delta.y };
 
       const conns = lineDragConnectionsRef.current;
       const areaConns = lineDragAreaConnectionsRef.current;
+      const groupOrigins = lineDragGroupOriginRef.current;
       setBoard((b) => ({
         ...b,
         lines: b.lines.map((l) => {
           if (l.id === lineId) {
             return { ...l, x1: newStart.x, y1: newStart.y, x2: newEnd.x, y2: newEnd.y, mid: newMid };
+          }
+          // Rectangle group-mate — translated rigidly by the same delta,
+          // so the shape never shears like the generic cascade would.
+          const groupOrigin = groupOrigins.find((g) => g.id === l.id);
+          if (groupOrigin) {
+            return {
+              ...l,
+              x1: groupOrigin.x1 + delta.x,
+              y1: groupOrigin.y1 + delta.y,
+              x2: groupOrigin.x2 + delta.x,
+              y2: groupOrigin.y2 + delta.y,
+              mid: { x: groupOrigin.mid.x + delta.x, y: groupOrigin.mid.y + delta.y },
+            };
           }
           const hits = conns.filter((c) => c.id === l.id);
           if (!hits.length) return l;
@@ -671,6 +1089,7 @@ export default function CanvasBoard({ boardId }: { boardId: string }) {
     lineDragOriginRef.current = null;
     lineDragConnectionsRef.current = [];
     lineDragAreaConnectionsRef.current = [];
+    lineDragGroupOriginRef.current = [];
   }, []);
 
   // --- select: recolor / delete the selected line ---------------------------
@@ -704,16 +1123,21 @@ export default function CanvasBoard({ boardId }: { boardId: string }) {
       const symbol = kind === "door" ? newDoor(worldCenter, color) : newWindow(worldCenter, color);
       setBoard((b) => ({ ...b, symbols: [...b.symbols, symbol], updatedAt: Date.now() }));
       setFavoritesOpen(false);
+      // Land straight in "estirar" so you can drag it onto a wall and resize
+      // it right away, without an extra tool switch.
+      setToolRaw("stretch");
     },
     [pushHistory, toWorld, stageSize, color]
   );
 
   // Dragging a door/window's body moves it and re-aligns it (position +
   // angle) onto whatever wall it lands near — the "dynamic block" behavior.
+  // Alignment is judged from the symbol's own center, not its anchor corner,
+  // so it snaps naturally no matter which part of it you happened to grab.
   const handleSymbolDragStart = useCallback(
     (s: SymbolInstance) => {
       pushHistory();
-      symbolDragOriginRef.current = { x: s.x, y: s.y, angle: s.angle };
+      symbolDragOriginRef.current = { x: s.x, y: s.y, angle: s.angle, length: s.length };
     },
     [pushHistory]
   );
@@ -725,14 +1149,19 @@ export default function CanvasBoard({ boardId }: { boardId: string }) {
     let newX = origin.x + delta.x;
     let newY = origin.y + delta.y;
     let newAngle = origin.angle;
+    const cos0 = Math.cos(origin.angle);
+    const sin0 = Math.sin(origin.angle);
+    const center = { x: newX + (cos0 * origin.length) / 2, y: newY + (sin0 * origin.length) / 2 };
     let best: { dist: number } | null = null;
     for (const l of boardRef.current.lines) {
-      const { point, dist } = projectOntoSegment({ x: newX, y: newY }, { x: l.x1, y: l.y1 }, { x: l.x2, y: l.y2 });
+      const { point, dist } = projectOntoSegment(center, { x: l.x1, y: l.y1 }, { x: l.x2, y: l.y2 });
       if (dist <= WALL_ALIGN_DIST && (!best || dist < best.dist)) {
         best = { dist };
-        newX = point.x;
-        newY = point.y;
         newAngle = Math.atan2(l.y2 - l.y1, l.x2 - l.x1);
+        const cos1 = Math.cos(newAngle);
+        const sin1 = Math.sin(newAngle);
+        newX = point.x - (cos1 * origin.length) / 2;
+        newY = point.y - (sin1 * origin.length) / 2;
       }
     }
     setBoard((b) => ({
@@ -747,8 +1176,13 @@ export default function CanvasBoard({ boardId }: { boardId: string }) {
     symbolDragOriginRef.current = null;
   }, []);
 
-  // Door: a single handle at the free end of the leaf — dragging it changes
-  // `length`, and the whole shape (leaf + swing arc) scales from that.
+  // Door: the hinge is the one point you move to place/align the door — it
+  // snaps onto a wall face like everything else, but ALSO picks up that
+  // wall's angle (so bringing it near a wall at a different angle turns
+  // the door to match, instead of just sliding). With no wall nearby it
+  // falls back to sliding along its own current angle, so it still can't
+  // go diagonal. While dragging, a live readout shows the distance from
+  // the aligned wall's nearer end — just a placement aid, not stored.
   const handleDoorResizeStart = useCallback(
     (s: SymbolInstance) => {
       pushHistory();
@@ -757,36 +1191,152 @@ export default function CanvasBoard({ boardId }: { boardId: string }) {
     [pushHistory]
   );
 
-  const handleDoorResizeMove = useCallback((id: string, e: KonvaEventObject<DragEvent>) => {
-    if (!doorResizeOriginRef.current) return;
+  const handleDoorResizeMove = useCallback((e: KonvaEventObject<DragEvent>) => {
+    const origin = doorResizeOriginRef.current;
+    if (!origin) return;
     const raw = e.target.position();
+    const s = boardRef.current.symbols.find((sym) => sym.id === origin.id);
+    if (!s) return;
+
+    const oldHinge = { x: s.x, y: s.y };
+    const target = resizeEndpointTarget(raw, oldHinge, s.angle, boardRef.current.lines, WALL_ALIGN_DIST);
+    const wallHit = findWallAlignment(raw, boardRef.current.lines, WALL_ALIGN_DIST);
+    const angle = wallHit ? wallHit.angle : s.angle;
     setBoard((b) => ({
       ...b,
-      symbols: b.symbols.map((s) => {
-        if (s.id !== id) return s;
-        const dx = raw.x - s.x;
-        const dy = raw.y - s.y;
-        const length = Math.max(0.2, Math.hypot(dx, dy));
-        const angle = Math.atan2(dy, dx);
-        return { ...s, length, angle };
-      }),
+      symbols: b.symbols.map((sym) => (sym.id === origin.id ? { ...sym, x: target.x, y: target.y, angle } : sym)),
       updatedAt: Date.now(),
     }));
+    e.target.position(target);
+
+    if (wallHit) {
+      // Read toward whichever wall end the frame is extending towards (its
+      // mirror*angle direction) — mirroring the door should read the
+      // opposite end, not just whichever end happens to be nearer.
+      const mirror = s.mirror ?? 1;
+      const forward = { x: Math.cos(angle) * mirror, y: Math.sin(angle) * mirror };
+      const projStart = (wallHit.lineStart.x - target.x) * forward.x + (wallHit.lineStart.y - target.y) * forward.y;
+      const projEnd = (wallHit.lineEnd.x - target.x) * forward.x + (wallHit.lineEnd.y - target.y) * forward.y;
+      const chosen = projStart >= projEnd ? wallHit.lineStart : wallHit.lineEnd;
+      setDoorHingeReadout({ x: target.x, y: target.y, text: `${distance(target, chosen).toFixed(2)} m` });
+    } else {
+      setDoorHingeReadout(null);
+    }
   }, []);
 
   const handleDoorResizeEnd = useCallback(() => {
     doorResizeOriginRef.current = null;
+    setDoorHingeReadout(null);
   }, []);
 
-  // Window: a handle at each end — grab either one to extend/shrink from
-  // that side, like stretching a line.
-  const handleWindowResizeStart = useCallback(
-    (s: SymbolInstance, end: "p1" | "p2") => {
+  // Frame: the blue control stretches how far the jamb ticks reach into
+  // the wall, fitting them to the wall's real thickness — wall-aligned by
+  // default, perpendicular-constrained otherwise, same as every other
+  // resize in this app.
+  const handleDoorFrameResizeStart = useCallback(
+    (s: SymbolInstance) => {
       pushHistory();
-      const cos = Math.cos(s.angle);
-      const sin = Math.sin(s.angle);
-      const p2 = { x: s.x + cos * s.length, y: s.y + sin * s.length };
-      windowResizeOriginRef.current = { id: s.id, end, fixedPoint: end === "p1" ? p2 : { x: s.x, y: s.y } };
+      doorFrameResizeOriginRef.current = { id: s.id };
+    },
+    [pushHistory]
+  );
+
+  const handleDoorFrameResizeMove = useCallback((e: KonvaEventObject<DragEvent>) => {
+    const origin = doorFrameResizeOriginRef.current;
+    if (!origin) return;
+    const raw = e.target.position();
+    const s = boardRef.current.symbols.find((sym) => sym.id === origin.id);
+    if (!s) return;
+    const g = doorGeometry(s);
+    const axisAngle = s.angle + Math.PI / 2;
+    // Pure axis lock, no wall search — this circle only ever adjusts the
+    // frame's own depth, so it can't jump to an unrelated wall nearby.
+    const target = resizeEndpointTarget(raw, g.closedEnd, axisAngle, [], WALL_ALIGN_DIST);
+    const d = { x: target.x - g.closedEnd.x, y: target.y - g.closedEnd.y };
+    const signed = d.x * g.perp.x + d.y * g.perp.y;
+    const frameDepth = Math.sign(signed || 1) * Math.max(0.02, Math.abs(signed));
+    setBoard((b) => ({
+      ...b,
+      symbols: b.symbols.map((sym) => (sym.id === origin.id ? { ...sym, frameDepth } : sym)),
+      updatedAt: Date.now(),
+    }));
+    e.target.position(target);
+  }, []);
+
+  const handleDoorFrameResizeEnd = useCallback(() => {
+    doorFrameResizeOriginRef.current = null;
+  }, []);
+
+  const handleToggleDoorMirror = useCallback(
+    (s: SymbolInstance) => {
+      pushHistory();
+      setBoard((b) => ({
+        ...b,
+        symbols: b.symbols.map((sym) => (sym.id === s.id ? { ...sym, mirror: (sym.mirror ?? 1) === 1 ? -1 : 1 } : sym)),
+        updatedAt: Date.now(),
+      }));
+    },
+    [pushHistory]
+  );
+
+  // --- puerta: ancho editable tocando la cota -------------------------------
+
+  const openDoorWidthEditor = useCallback(
+    (s: SymbolInstance) => {
+      if (tool === "eraser" || tool === "pan") return;
+      const mid = { x: s.x + (Math.cos(s.angle) * s.length) / 2, y: s.y + (Math.sin(s.angle) * s.length) / 2 };
+      setEditingDoorWidth({
+        id: s.id,
+        screenX: mid.x * scale + pos.x,
+        screenY: mid.y * scale + pos.y,
+        value: s.length.toFixed(2),
+      });
+    },
+    [tool, scale, pos]
+  );
+
+  const commitDoorWidth = useCallback(() => {
+    setEditingDoorWidth((cur) => {
+      if (!cur) return null;
+      const n = parseFloat(cur.value.replace(",", "."));
+      if (Number.isFinite(n) && n > 0) {
+        pushHistory();
+        const length = Math.max(0.2, n);
+        setBoard((b) => ({
+          ...b,
+          symbols: b.symbols.map((sym) => (sym.id === cur.id ? { ...sym, length } : sym)),
+          updatedAt: Date.now(),
+        }));
+      }
+      return null;
+    });
+  }, [pushHistory]);
+
+  const cancelDoorWidth = useCallback(() => setEditingDoorWidth(null), []);
+
+  // Window: 4 corner handles. Each drag is locked to ONE axis — the long
+  // (length) edge it sits on, or the short (depth) edge — decided from
+  // whichever axis the drag has moved further along, so it can never go
+  // diagonal and lose the rectangle's shape. Length-axis drags align a long
+  // EDGE (not the centerline) onto a nearby wall face; depth-axis drags do
+  // the same for fitting the wall's thickness.
+  const handleWindowResizeStart = useCallback(
+    (s: SymbolInstance, cornerIndex: number) => {
+      pushHistory();
+      const g = windowGeometry(s);
+      const info = WINDOW_CORNERS[cornerIndex];
+      windowResizeOriginRef.current = {
+        id: s.id,
+        cornerIndex,
+        startCorner: g.corners[cornerIndex],
+        lengthFixed: g.corners[info.lengthPartner],
+        depthFixed: g.corners[info.depthPartner],
+        dir: g.dir,
+        perp: g.perp,
+        angle: s.angle,
+        length: s.length,
+        depth: s.depth ?? WINDOW_DEFAULT_DEPTH,
+      };
     },
     [pushHistory]
   );
@@ -795,22 +1345,51 @@ export default function CanvasBoard({ boardId }: { boardId: string }) {
     const origin = windowResizeOriginRef.current;
     if (!origin) return;
     const raw = e.target.position();
-    const fixed = origin.fixedPoint;
-    setBoard((b) => ({
-      ...b,
-      symbols: b.symbols.map((s) => {
-        if (s.id !== origin.id) return s;
-        if (origin.end === "p2") {
-          const length = Math.max(0.2, Math.hypot(raw.x - s.x, raw.y - s.y));
-          const angle = Math.atan2(raw.y - s.y, raw.x - s.x);
-          return { ...s, length, angle };
-        }
-        const length = Math.max(0.2, Math.hypot(fixed.x - raw.x, fixed.y - raw.y));
-        const angle = Math.atan2(fixed.y - raw.y, fixed.x - raw.x);
-        return { ...s, x: raw.x, y: raw.y, length, angle };
-      }),
-      updatedAt: Date.now(),
-    }));
+    const info = WINDOW_CORNERS[origin.cornerIndex];
+
+    const totalDelta = { x: raw.x - origin.startCorner.x, y: raw.y - origin.startCorner.y };
+    const lengthComponent = totalDelta.x * origin.dir.x + totalDelta.y * origin.dir.y;
+    const depthComponent = totalDelta.x * origin.perp.x + totalDelta.y * origin.perp.y;
+    const mode: "length" | "depth" = Math.abs(lengthComponent) >= Math.abs(depthComponent) ? "length" : "depth";
+
+    if (mode === "length") {
+      const fixed = origin.lengthFixed;
+      const target = resizeEndpointTarget(raw, fixed, origin.angle, boardRef.current.lines, WALL_ALIGN_DIST);
+      const newLength = Math.max(0.2, distance(fixed, target));
+      // fixed->target runs p1->p2 if the dragged corner is the p2 end,
+      // p2->p1 if it's the p1 end — flip so newAngle always means p1->p2.
+      const endSign = info.end === "p2" ? 1 : -1;
+      const newAngle = Math.atan2(endSign * (target.y - fixed.y), endSign * (target.x - fixed.x));
+      const newPerp = { x: -Math.sin(newAngle), y: Math.cos(newAngle) };
+      const hd = origin.depth / 2;
+      const fixedCenterline = { x: fixed.x - newPerp.x * hd * info.face, y: fixed.y - newPerp.y * hd * info.face };
+      const targetCenterline = { x: target.x - newPerp.x * hd * info.face, y: target.y - newPerp.y * hd * info.face };
+      const newP1 = info.end === "p1" ? targetCenterline : fixedCenterline;
+      setBoard((b) => ({
+        ...b,
+        symbols: b.symbols.map((sym) =>
+          sym.id === origin.id ? { ...sym, x: newP1.x, y: newP1.y, length: newLength, angle: newAngle } : sym
+        ),
+        updatedAt: Date.now(),
+      }));
+      e.target.position(target);
+    } else {
+      const fixed = origin.depthFixed;
+      const axisAngle = origin.angle + Math.PI / 2;
+      const target = resizeEndpointTarget(raw, fixed, axisAngle, boardRef.current.lines, WALL_ALIGN_DIST);
+      const newDepth = Math.max(0.05, distance(fixed, target));
+      const thisEndCenterline = { x: (fixed.x + target.x) / 2, y: (fixed.y + target.y) / 2 };
+      const newP1 =
+        info.end === "p1"
+          ? thisEndCenterline
+          : { x: thisEndCenterline.x - origin.dir.x * origin.length, y: thisEndCenterline.y - origin.dir.y * origin.length };
+      setBoard((b) => ({
+        ...b,
+        symbols: b.symbols.map((sym) => (sym.id === origin.id ? { ...sym, x: newP1.x, y: newP1.y, depth: newDepth } : sym)),
+        updatedAt: Date.now(),
+      }));
+      e.target.position(target);
+    }
   }, []);
 
   const handleWindowResizeEnd = useCallback(() => {
@@ -939,12 +1518,23 @@ export default function CanvasBoard({ boardId }: { boardId: string }) {
     board.symbols.forEach((s) => {
       if (s.kind === "door") {
         const g = doorGeometry(s);
-        points.push(g.hinge, g.leafEnd, g.swingEnd);
+        points.push(g.hinge, g.closedEnd, g.openEnd, g.closedEndTick.b);
       } else {
         const g = windowGeometry(s);
         points.push(...g.corners);
       }
     });
+    board.ellipses.forEach((el) => {
+      points.push(
+        { x: el.cx - el.rx, y: el.cy - el.ry },
+        { x: el.cx + el.rx, y: el.cy + el.ry }
+      );
+    });
+    board.texts.forEach((t) => points.push({ x: t.x, y: t.y }));
+    if (board.background) {
+      const bg = board.background;
+      points.push({ x: bg.x, y: bg.y }, { x: bg.x + bg.width, y: bg.y + bg.height });
+    }
 
     const prevScale = stage.scaleX();
     const prevPos = stage.position();
@@ -981,6 +1571,15 @@ export default function CanvasBoard({ boardId }: { boardId: string }) {
     doc.addImage(dataUrl, "PNG", 0, 0, w, h);
     const safeName = (board.name || "levantamiento").replace(/[^a-z0-9-_ ]/gi, "").trim();
     doc.save(`${safeName || "levantamiento"}.pdf`);
+    // Keep a copy in the app too — a download can get lost in the device's
+    // Files app, but this stays reachable from the home page.
+    savePdfExport({
+      id: makeId("pdf"),
+      boardId: board.id,
+      boardName: board.name,
+      createdAt: Date.now(),
+      blob: doc.output("blob"),
+    });
   }, [board]);
 
   const totalMl = board.lines.reduce((sum, l) => {
@@ -991,7 +1590,7 @@ export default function CanvasBoard({ boardId }: { boardId: string }) {
   const totalM2 = board.areas.reduce((sum, a) => sum + polygonArea(a.points), 0);
 
   const selectedLine = selectedLineId ? board.lines.find((l) => l.id === selectedLineId) ?? null : null;
-  const showLabels = scale >= LABEL_MIN_SCALE;
+  const showLabels = showDimensions && scale >= LABEL_MIN_SCALE;
 
   return (
     <div className="h-dvh w-dvw flex flex-col bg-paper overflow-hidden">
@@ -1004,6 +1603,8 @@ export default function CanvasBoard({ boardId }: { boardId: string }) {
         setColor={setColor}
         ortho={ortho}
         setOrtho={setOrtho}
+        showDimensions={showDimensions}
+        setShowDimensions={setShowDimensions}
         onExportPdf={handleExportPdf}
         onNewBoard={handleNewBoard}
         panelOpen={panelOpen}
@@ -1088,6 +1689,41 @@ export default function CanvasBoard({ boardId }: { boardId: string }) {
                     }}
                   />
                 )}
+                {scale >= ULTRA_FINE_GRID_MIN_SCALE && (
+                  <Shape
+                    width={WORLD_W}
+                    height={WORLD_H}
+                    fill="#efeeed"
+                    perfectDrawEnabled={false}
+                    sceneFunc={(context, shape) => {
+                      context.beginPath();
+                      const r = 0.02;
+                      // Only the visible viewport — at this zoom the full
+                      // 150x150m world would be way too many dots.
+                      const minGx = clamp(Math.floor(-pos.x / scale / ULTRA_FINE_GRID_STEP), 0, WORLD_W / ULTRA_FINE_GRID_STEP);
+                      const maxGx = clamp(
+                        Math.ceil((stageSize.width - pos.x) / scale / ULTRA_FINE_GRID_STEP),
+                        0,
+                        WORLD_W / ULTRA_FINE_GRID_STEP
+                      );
+                      const minGy = clamp(Math.floor(-pos.y / scale / ULTRA_FINE_GRID_STEP), 0, WORLD_H / ULTRA_FINE_GRID_STEP);
+                      const maxGy = clamp(
+                        Math.ceil((stageSize.height - pos.y) / scale / ULTRA_FINE_GRID_STEP),
+                        0,
+                        WORLD_H / ULTRA_FINE_GRID_STEP
+                      );
+                      for (let gx = minGx; gx <= maxGx; gx++) {
+                        for (let gy = minGy; gy <= maxGy; gy++) {
+                          const x = gx * ULTRA_FINE_GRID_STEP;
+                          const y = gy * ULTRA_FINE_GRID_STEP;
+                          context.moveTo(x + r, y);
+                          context.arc(x, y, r, 0, Math.PI * 2, false);
+                        }
+                      }
+                      context.fillStrokeShape(shape);
+                    }}
+                  />
+                )}
                 <Shape
                   width={WORLD_W}
                   height={WORLD_H}
@@ -1108,6 +1744,22 @@ export default function CanvasBoard({ boardId }: { boardId: string }) {
               </Layer>
 
               <Layer>
+                {board.background && backgroundImage && (
+                  <KonvaImage
+                    image={backgroundImage}
+                    x={board.background.x}
+                    y={board.background.y}
+                    width={board.background.width}
+                    height={board.background.height}
+                    opacity={board.background.opacity}
+                    listening={!board.background.locked && (tool === "stretch" || tool === "select")}
+                    draggable={!board.background.locked && (tool === "stretch" || tool === "select")}
+                    onDragStart={handleBackgroundDragStart}
+                    onDragMove={handleBackgroundDragMove}
+                    onDragEnd={handleBackgroundDragEnd}
+                  />
+                )}
+
                 {board.areas.map((a) => {
                   const area = polygonArea(a.points);
                   const cx = a.points.reduce((s, p) => s + p.x, 0) / a.points.length;
@@ -1155,17 +1807,88 @@ export default function CanvasBoard({ boardId }: { boardId: string }) {
                   </>
                 )}
 
+                {drawingAreaChain && drawingAreaChain.length > 0 && (
+                  <>
+                    <Line
+                      points={flatten(drawingAreaChain)}
+                      stroke={color}
+                      strokeWidth={3 / scale}
+                      dash={[6 / scale, 5 / scale]}
+                      lineCap="round"
+                      listening={false}
+                    />
+                    <Circle
+                      x={drawingAreaChain[0].x}
+                      y={drawingAreaChain[0].y}
+                      radius={6 / scale}
+                      fill={color}
+                      listening={false}
+                    />
+                  </>
+                )}
+
+                {board.ellipses.map((el) => (
+                  <Ellipse
+                    key={el.id}
+                    x={el.cx}
+                    y={el.cy}
+                    radiusX={el.rx}
+                    radiusY={el.ry}
+                    stroke={el.color}
+                    strokeWidth={2 / scale}
+                    hitStrokeWidth={16 / scale}
+                    draggable={tool === "stretch" || tool === "select"}
+                    onDragStart={() => handleEllipseDragStart(el)}
+                    onDragMove={(e) => handleEllipseDragMove(el.id, e)}
+                    onDragEnd={handleEllipseDragEnd}
+                    onClick={() => handleEraseShape(el.id, "ellipse")}
+                    onTap={() => handleEraseShape(el.id, "ellipse")}
+                  />
+                ))}
+
+                {(tool === "stretch" || tool === "select") &&
+                  board.ellipses.map((el) => (
+                    <Circle
+                      key={`${el.id}-resize`}
+                      x={el.cx + el.rx}
+                      y={el.cy + el.ry}
+                      radius={7 / scale}
+                      fill="#ffffff"
+                      stroke="#c2410c"
+                      strokeWidth={2 / scale}
+                      hitStrokeWidth={26 / scale}
+                      draggable
+                      onDragStart={() => handleEllipseResizeStart(el)}
+                      onDragMove={(e) => handleEllipseResizeMove(el.id, e)}
+                      onDragEnd={handleEllipseResizeEnd}
+                    />
+                  ))}
+
+                {board.background && !board.background.locked && (tool === "stretch" || tool === "select") && (
+                  <Circle
+                    x={board.background.x + board.background.width}
+                    y={board.background.y + board.background.height}
+                    radius={8 / scale}
+                    fill="#ffffff"
+                    stroke="#c2410c"
+                    strokeWidth={2 / scale}
+                    hitStrokeWidth={28 / scale}
+                    draggable
+                    onDragStart={handleBackgroundResizeStart}
+                    onDragMove={handleBackgroundResizeMove}
+                    onDragEnd={handleBackgroundResizeEnd}
+                  />
+                )}
+
                 {board.notes.map((n) => (
                   <Line
                     key={n.id}
                     points={n.points}
                     stroke={n.color}
-                    strokeWidth={2 / scale}
+                    strokeWidth={1.6 / scale}
                     lineCap="round"
                     lineJoin="round"
-                    tension={0.4}
-                    opacity={0.75}
-                    dash={[1, 4]}
+                    tension={0.15}
                     hitStrokeWidth={16 / scale}
                     onClick={() => handleEraseShape(n.id, "note")}
                     onTap={() => handleEraseShape(n.id, "note")}
@@ -1200,11 +1923,13 @@ export default function CanvasBoard({ boardId }: { boardId: string }) {
                     onClick={() => {
                       if (tool === "eraser") handleEraseShape(l.id, "measure");
                       else if (tool === "select") setSelectedLineId(l.id);
+                      else if (tool === "area" && areaMode === "lineas") handleAreaLineClick(l);
                       else openValueEditor(l);
                     }}
                     onTap={() => {
                       if (tool === "eraser") handleEraseShape(l.id, "measure");
                       else if (tool === "select") setSelectedLineId(l.id);
+                      else if (tool === "area" && areaMode === "lineas") handleAreaLineClick(l);
                       else openValueEditor(l);
                     }}
                   />
@@ -1213,25 +1938,30 @@ export default function CanvasBoard({ boardId }: { boardId: string }) {
                 {board.symbols.map((s) => {
                   if (s.kind === "door") {
                     const g = doorGeometry(s);
+                    // Offset purely along +perp (opposite the fixed swing side) so it
+                    // stays clear of the leaf and frame regardless of `mirror`.
+                    const mirrorBtn = { x: s.x + g.perp.x * 0.8, y: s.y + g.perp.y * 0.8 };
                     return (
                       <Group
                         key={s.id}
-                        draggable={tool === "stretch"}
+                        draggable={tool === "stretch" || tool === "select"}
                         onDragStart={() => handleSymbolDragStart(s)}
                         onDragMove={(e) => handleSymbolDragMove(s.id, e)}
                         onDragEnd={handleSymbolDragEnd}
                         onClick={() => handleEraseShape(s.id, "symbol")}
                         onTap={() => handleEraseShape(s.id, "symbol")}
                       >
+                        {/* "la puerta": the leaf, drawn open (perpendicular to the wall). */}
                         <Line
-                          points={[g.hinge.x, g.hinge.y, g.leafEnd.x, g.leafEnd.y]}
+                          points={[g.hinge.x, g.hinge.y, g.openEnd.x, g.openEnd.y]}
                           stroke={s.color}
                           strokeWidth={2.5 / scale}
                           lineCap="round"
                           hitStrokeWidth={20 / scale}
                         />
+                        {/* "la proyección": the swing sweep back to where the leaf sits flush in the wall. */}
                         <Line
-                          points={[g.leafEnd.x, g.leafEnd.y, g.arcMid.x, g.arcMid.y, g.swingEnd.x, g.swingEnd.y]}
+                          points={[g.openEnd.x, g.openEnd.y, g.arcMid.x, g.arcMid.y, g.closedEnd.x, g.closedEnd.y]}
                           tension={0.5}
                           stroke={s.color}
                           strokeWidth={1.3 / scale}
@@ -1239,6 +1969,47 @@ export default function CanvasBoard({ boardId }: { boardId: string }) {
                           opacity={0.7}
                           hitStrokeWidth={16 / scale}
                         />
+                        {/* "el marco": jamb ticks spanning the wall's thickness — not draggable, just follow hinge/closedEnd. */}
+                        <Line
+                          points={[g.hingeTick.a.x, g.hingeTick.a.y, g.hingeTick.b.x, g.hingeTick.b.y]}
+                          stroke={s.color}
+                          strokeWidth={2 / scale}
+                          listening={false}
+                        />
+                        <Line
+                          points={[g.closedEndTick.a.x, g.closedEndTick.a.y, g.closedEndTick.b.x, g.closedEndTick.b.y]}
+                          stroke={s.color}
+                          strokeWidth={2 / scale}
+                          listening={false}
+                        />
+                        {(tool === "stretch" || tool === "select") && (
+                          <Group
+                            x={mirrorBtn.x}
+                            y={mirrorBtn.y}
+                            onClick={(e) => {
+                              e.cancelBubble = true;
+                              handleToggleDoorMirror(s);
+                            }}
+                            onTap={(e) => {
+                              e.cancelBubble = true;
+                              handleToggleDoorMirror(s);
+                            }}
+                          >
+                            <Circle radius={8 / scale} fill="#ffffff" stroke="#78716c" strokeWidth={1.3 / scale} hitStrokeWidth={10 / scale} />
+                            <Text
+                              text="⇋"
+                              fontSize={11 / scale}
+                              fill="#78716c"
+                              width={16 / scale}
+                              height={16 / scale}
+                              offsetX={8 / scale}
+                              offsetY={8 / scale}
+                              align="center"
+                              verticalAlign="middle"
+                              listening={false}
+                            />
+                          </Group>
+                        )}
                       </Group>
                     );
                   }
@@ -1246,7 +2017,7 @@ export default function CanvasBoard({ boardId }: { boardId: string }) {
                   return (
                     <Group
                       key={s.id}
-                      draggable={tool === "stretch"}
+                      draggable={tool === "stretch" || tool === "select"}
                       onDragStart={() => handleSymbolDragStart(s)}
                       onDragMove={(e) => handleSymbolDragMove(s.id, e)}
                       onDragEnd={handleSymbolDragEnd}
@@ -1270,59 +2041,78 @@ export default function CanvasBoard({ boardId }: { boardId: string }) {
                   );
                 })}
 
-                {tool === "stretch" &&
+                {(tool === "stretch" || tool === "select") &&
                   board.symbols.map((s) => {
                     if (s.kind === "door") {
                       const g = doorGeometry(s);
                       return (
-                        <Circle
-                          key={`${s.id}-resize`}
-                          x={g.leafEnd.x}
-                          y={g.leafEnd.y}
-                          radius={6 / scale}
-                          fill="#ffffff"
-                          stroke={s.color}
-                          strokeWidth={2 / scale}
-                          hitStrokeWidth={24 / scale}
-                          draggable
-                          onDragStart={() => handleDoorResizeStart(s)}
-                          onDragMove={(e) => handleDoorResizeMove(s.id, e)}
-                          onDragEnd={handleDoorResizeEnd}
-                        />
+                        <Fragment key={`${s.id}-resize`}>
+                          <Circle
+                            x={g.hinge.x}
+                            y={g.hinge.y}
+                            radius={7 / scale}
+                            fill="#ffffff"
+                            stroke="#1c1b1a"
+                            strokeWidth={2 / scale}
+                            hitStrokeWidth={26 / scale}
+                            draggable
+                            onDragStart={() => handleDoorResizeStart(s)}
+                            onDragMove={handleDoorResizeMove}
+                            onDragEnd={handleDoorResizeEnd}
+                          />
+                          <Circle
+                            x={g.closedEndTick.b.x}
+                            y={g.closedEndTick.b.y}
+                            radius={7 / scale}
+                            fill="#ffffff"
+                            stroke="#2563eb"
+                            strokeWidth={2 / scale}
+                            hitStrokeWidth={26 / scale}
+                            draggable
+                            onDragStart={() => handleDoorFrameResizeStart(s)}
+                            onDragMove={handleDoorFrameResizeMove}
+                            onDragEnd={handleDoorFrameResizeEnd}
+                          />
+                        </Fragment>
                       );
                     }
                     const g = windowGeometry(s);
                     return (
                       <Fragment key={`${s.id}-resize`}>
-                        <Circle
-                          x={g.p1.x}
-                          y={g.p1.y}
-                          radius={6 / scale}
-                          fill="#ffffff"
-                          stroke={s.color}
-                          strokeWidth={2 / scale}
-                          hitStrokeWidth={24 / scale}
-                          draggable
-                          onDragStart={() => handleWindowResizeStart(s, "p1")}
-                          onDragMove={handleWindowResizeMove}
-                          onDragEnd={handleWindowResizeEnd}
-                        />
-                        <Circle
-                          x={g.p2.x}
-                          y={g.p2.y}
-                          radius={6 / scale}
-                          fill="#ffffff"
-                          stroke={s.color}
-                          strokeWidth={2 / scale}
-                          hitStrokeWidth={24 / scale}
-                          draggable
-                          onDragStart={() => handleWindowResizeStart(s, "p2")}
-                          onDragMove={handleWindowResizeMove}
-                          onDragEnd={handleWindowResizeEnd}
-                        />
+                        {g.corners.map((c, i) => (
+                          <Circle
+                            key={i}
+                            x={c.x}
+                            y={c.y}
+                            radius={7 / scale}
+                            fill="#ffffff"
+                            stroke="#c2410c"
+                            strokeWidth={2 / scale}
+                            hitStrokeWidth={26 / scale}
+                            draggable
+                            onDragStart={() => handleWindowResizeStart(s, i)}
+                            onDragMove={handleWindowResizeMove}
+                            onDragEnd={handleWindowResizeEnd}
+                          />
+                        ))}
                       </Fragment>
                     );
                   })}
+
+                {doorHingeReadout && (
+                  <Text
+                    x={doorHingeReadout.x}
+                    y={doorHingeReadout.y}
+                    text={doorHingeReadout.text}
+                    fontSize={12 / scale}
+                    fontFamily="ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace"
+                    fill="#c2410c"
+                    padding={3 / scale}
+                    offsetY={26 / scale}
+                    align="center"
+                    listening={false}
+                  />
+                )}
 
                 {drawingLine && (
                   <>
@@ -1344,6 +2134,65 @@ export default function CanvasBoard({ boardId }: { boardId: string }) {
                       align="center"
                       listening={false}
                     />
+                  </>
+                )}
+                {drawingLine &&
+                  lineAlignGuides?.map((g, i) => {
+                    const margin = 0.3;
+                    const points =
+                      g.axis === "x"
+                        ? [g.from.x, Math.min(g.from.y, drawingLine.end.y) - margin, g.from.x, Math.max(g.from.y, drawingLine.end.y) + margin]
+                        : [Math.min(g.from.x, drawingLine.end.x) - margin, g.from.y, Math.max(g.from.x, drawingLine.end.x) + margin, g.from.y];
+                    return (
+                      <Line
+                        key={i}
+                        points={points}
+                        stroke="#ec4899"
+                        strokeWidth={1 / scale}
+                        dash={[5 / scale, 4 / scale]}
+                        listening={false}
+                      />
+                    );
+                  })}
+                {ruler && (
+                  <>
+                    <Line
+                      points={
+                        ruler.end
+                          ? [ruler.start.x, ruler.start.y, ruler.end.x, ruler.end.y]
+                          : ruler.hover
+                            ? [ruler.start.x, ruler.start.y, ruler.hover.x, ruler.hover.y]
+                            : [ruler.start.x, ruler.start.y]
+                      }
+                      stroke="#c2410c"
+                      strokeWidth={2 / scale}
+                      dash={[5 / scale, 4 / scale]}
+                      lineCap="round"
+                      listening={false}
+                    />
+                    <Circle x={ruler.start.x} y={ruler.start.y} radius={4 / scale} fill="#c2410c" listening={false} />
+                    {(ruler.end ?? ruler.hover) && (
+                      <>
+                        <Circle
+                          x={(ruler.end ?? ruler.hover)!.x}
+                          y={(ruler.end ?? ruler.hover)!.y}
+                          radius={4 / scale}
+                          fill="#c2410c"
+                          listening={false}
+                        />
+                        <Text
+                          x={(ruler.start.x + (ruler.end ?? ruler.hover)!.x) / 2}
+                          y={(ruler.start.y + (ruler.end ?? ruler.hover)!.y) / 2}
+                          text={`${distance(ruler.start, (ruler.end ?? ruler.hover)!).toFixed(2)} m`}
+                          fontSize={13 / scale}
+                          fontFamily="ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace"
+                          fill="#c2410c"
+                          offsetY={18 / scale}
+                          align="center"
+                          listening={false}
+                        />
+                      </>
+                    )}
                   </>
                 )}
                 {drawingBox && (
@@ -1375,12 +2224,10 @@ export default function CanvasBoard({ boardId }: { boardId: string }) {
                   <Line
                     points={drawingNote}
                     stroke={color}
-                    strokeWidth={2 / scale}
+                    strokeWidth={1.6 / scale}
                     lineCap="round"
                     lineJoin="round"
-                    tension={0.4}
-                    dash={[1, 4]}
-                    opacity={0.75}
+                    tension={0.15}
                   />
                 )}
 
@@ -1400,15 +2247,8 @@ export default function CanvasBoard({ boardId }: { boardId: string }) {
                       strokeWidth={2 / scale}
                       hitStrokeWidth={26 / scale}
                       draggable
-                      onDragStart={pushHistory}
-                      onDragMove={(e) => {
-                        const p = e.target.position();
-                        setBoard((b) => ({
-                          ...b,
-                          lines: b.lines.map((ln) => (ln.id === l.id ? { ...ln, mid: { x: p.x, y: p.y } } : ln)),
-                          updatedAt: Date.now(),
-                        }));
-                      }}
+                      onDragStart={curveMidDragStart}
+                      onDragMove={(e) => curveMidDragMove(l, e)}
                       onDblClick={() => resetMid(l.id)}
                       onDblTap={() => resetMid(l.id)}
                     />
@@ -1447,11 +2287,63 @@ export default function CanvasBoard({ boardId }: { boardId: string }) {
                         padding={3 / scale}
                         offsetY={18 / scale}
                         align="center"
-                        onClick={() => openValueEditor(l)}
-                        onTap={() => openValueEditor(l)}
+                        onClick={() => openValueEditor(l, true)}
+                        onTap={() => openValueEditor(l, true)}
                       />
                     );
                   })}
+
+                {showLabels &&
+                  board.symbols.map((s) => {
+                    const cos = Math.cos(s.angle);
+                    const sin = Math.sin(s.angle);
+                    const perp = { x: -sin, y: cos };
+                    const offset = 14 / scale;
+                    const mid = { x: s.x + (cos * s.length) / 2, y: s.y + (sin * s.length) / 2 };
+                    const isDoor = s.kind === "door";
+                    return (
+                      <Text
+                        key={`${s.id}-label`}
+                        x={mid.x + perp.x * offset}
+                        y={mid.y + perp.y * offset}
+                        text={`${s.length.toFixed(2)} m`}
+                        fontSize={12 / scale}
+                        fontFamily="ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace"
+                        fill={isDoor ? "#1c1b1a" : "#78716c"}
+                        padding={isDoor ? 2 / scale : 0}
+                        align="center"
+                        offsetX={20 / scale}
+                        listening={isDoor}
+                        onClick={isDoor ? () => openDoorWidthEditor(s) : undefined}
+                        onTap={isDoor ? () => openDoorWidthEditor(s) : undefined}
+                      />
+                    );
+                  })}
+
+                {board.texts.map((t) => (
+                  <Text
+                    key={t.id}
+                    x={t.x}
+                    y={t.y}
+                    text={t.text}
+                    fontSize={16 / scale}
+                    fontFamily="ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace"
+                    fill={t.color}
+                    padding={2 / scale}
+                    draggable={tool === "stretch" || tool === "select"}
+                    onDragStart={() => handleTextDragStart(t)}
+                    onDragMove={handleTextDragMove}
+                    onDragEnd={handleTextDragEnd}
+                    onClick={() => {
+                      if (tool === "eraser") handleEraseShape(t.id, "text");
+                      else openTextEditor(t);
+                    }}
+                    onTap={() => {
+                      if (tool === "eraser") handleEraseShape(t.id, "text");
+                      else openTextEditor(t);
+                    }}
+                  />
+                ))}
               </Layer>
             </Stage>
           )}
@@ -1482,27 +2374,154 @@ export default function CanvasBoard({ boardId }: { boardId: string }) {
           </div>
         )}
 
-        {drawingArea && (
-          <div className="absolute bottom-4 left-1/2 z-20 flex -translate-x-1/2 items-center gap-2 rounded-lg border border-line bg-card px-3 py-2 shadow-lg">
-            <span className="font-mono text-xs text-ink-soft">{drawingArea.length} pts</span>
-            <button
-              type="button"
-              disabled={drawingArea.length < 3}
-              onClick={() => {
-                finalizeArea(drawingArea);
-                setDrawingArea(null);
+        {editingText && (
+          <div
+            className="absolute z-20 -translate-x-1/2 -translate-y-1/2"
+            style={{ left: editingText.screenX, top: editingText.screenY }}
+          >
+            <input
+              autoFocus
+              value={editingText.value}
+              onChange={(e) => {
+                const value = e.target.value;
+                setEditingText((cur) => (cur ? { ...cur, value } : cur));
               }}
-              className="rounded-md bg-accent px-2.5 py-1 font-mono text-xs font-medium text-white disabled:opacity-40"
+              onKeyDown={(e) => {
+                if (e.key === "Enter") commitEditingText();
+                if (e.key === "Escape") cancelEditingText();
+              }}
+              onBlur={commitEditingText}
+              placeholder="texto"
+              className="min-w-[6rem] rounded-md border-2 border-accent bg-white px-2 py-1 text-sm text-ink shadow-lg outline-none"
+            />
+          </div>
+        )}
+
+        {editingDoorWidth && (
+          <div
+            className="absolute z-20 -translate-x-1/2 -translate-y-1/2"
+            style={{ left: editingDoorWidth.screenX, top: editingDoorWidth.screenY }}
+          >
+            <input
+              autoFocus
+              inputMode="decimal"
+              value={editingDoorWidth.value}
+              onChange={(e) => {
+                const value = e.target.value;
+                setEditingDoorWidth((cur) => (cur ? { ...cur, value } : cur));
+              }}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") commitDoorWidth();
+                if (e.key === "Escape") cancelDoorWidth();
+              }}
+              onBlur={commitDoorWidth}
+              placeholder="metros"
+              className="w-24 rounded-md border-2 border-accent bg-white px-2 py-1 text-center font-mono text-sm text-ink shadow-lg outline-none"
+            />
+          </div>
+        )}
+
+        {board.background && (
+          <div className="absolute right-4 top-4 z-20 flex items-center gap-2 rounded-lg border border-line bg-card px-3 py-2 shadow-lg">
+            <span className="font-mono text-[11px] text-ink-faint">Fondo</span>
+            <input
+              type="range"
+              min={0.1}
+              max={1}
+              step={0.05}
+              value={board.background.opacity}
+              onChange={(e) => handleBackgroundOpacity(parseFloat(e.target.value))}
+              className="w-20"
+            />
+            <button
+              type="button"
+              onClick={handleBackgroundToggleLock}
+              className={`rounded-md border px-2 py-1 font-mono text-[11px] ${
+                board.background.locked ? "border-accent bg-accent-bg text-accent" : "border-line text-ink-soft"
+              }`}
             >
-              Cerrar área
+              {board.background.locked ? "Bloqueado" : "Bloquear"}
             </button>
             <button
               type="button"
-              onClick={() => setDrawingArea(null)}
-              className="rounded-md border border-line px-2.5 py-1 font-mono text-xs text-ink-soft"
+              onClick={handleBackgroundRemove}
+              className="rounded-md border border-line px-2 py-1 font-mono text-[11px] text-ink-soft hover:border-red-300 hover:text-red-600"
             >
-              Cancelar
+              Quitar
             </button>
+          </div>
+        )}
+
+        {tool === "area" && (
+          <div className="absolute bottom-4 left-1/2 z-20 flex -translate-x-1/2 items-center gap-2 rounded-lg border border-line bg-card px-3 py-2 shadow-lg">
+            <div className="flex overflow-hidden rounded-md border border-line font-mono text-xs">
+              <button
+                type="button"
+                onClick={() => {
+                  setDrawingAreaChain(null);
+                  setAreaMode("puntos");
+                }}
+                className={`px-2 py-1 ${areaMode === "puntos" ? "bg-accent text-white" : "bg-card text-ink-soft"}`}
+              >
+                Puntos
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setDrawingArea(null);
+                  setAreaMode("lineas");
+                }}
+                className={`px-2 py-1 ${areaMode === "lineas" ? "bg-accent text-white" : "bg-card text-ink-soft"}`}
+              >
+                Líneas
+              </button>
+            </div>
+            {areaMode === "puntos" && drawingArea && (
+              <>
+                <span className="font-mono text-xs text-ink-soft">{drawingArea.length} pts</span>
+                <button
+                  type="button"
+                  disabled={drawingArea.length < 3}
+                  onClick={() => {
+                    finalizeArea(drawingArea);
+                    setDrawingArea(null);
+                  }}
+                  className="rounded-md bg-accent px-2.5 py-1 font-mono text-xs font-medium text-white disabled:opacity-40"
+                >
+                  Cerrar área
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setDrawingArea(null)}
+                  className="rounded-md border border-line px-2.5 py-1 font-mono text-xs text-ink-soft"
+                >
+                  Cancelar
+                </button>
+              </>
+            )}
+            {areaMode === "lineas" && drawingAreaChain && (
+              <>
+                <span className="font-mono text-xs text-ink-soft">{drawingAreaChain.length} pts</span>
+                <button
+                  type="button"
+                  disabled={drawingAreaChain.length < 3}
+                  onClick={() => {
+                    finalizeArea(drawingAreaChain);
+                    setDrawingAreaChain(null);
+                  }}
+                  className="rounded-md bg-accent px-2.5 py-1 font-mono text-xs font-medium text-white disabled:opacity-40"
+                >
+                  Cerrar área
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setDrawingAreaChain(null)}
+                  className="rounded-md border border-line px-2.5 py-1 font-mono text-xs text-ink-soft"
+                >
+                  Cancelar
+                </button>
+              </>
+            )}
           </div>
         )}
 

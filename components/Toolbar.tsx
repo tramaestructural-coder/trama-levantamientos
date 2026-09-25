@@ -4,7 +4,7 @@ import { useEffect, useState } from "react";
 import Link from "next/link";
 import { PEN_COLORS, type LineColor } from "@/lib/types";
 
-type Tool = "line" | "curve" | "stretch" | "select" | "rect" | "ellipse" | "note" | "eraser" | "pan" | "area";
+type Tool = "line" | "curve" | "stretch" | "select" | "rect" | "ellipse" | "note" | "text" | "eraser" | "pan" | "area" | "ruler";
 
 const COLOR_NAMES: Record<LineColor, string> = {
   "#1c1b1a": "Negro",
@@ -114,6 +114,31 @@ function IconEllipse() {
   return (
     <svg width="18" height="18" viewBox="0 0 18 18" fill="none">
       <ellipse cx="9" cy="9" rx="6.5" ry="4.5" stroke="currentColor" strokeWidth="1.6" />
+    </svg>
+  );
+}
+function IconText() {
+  return (
+    <svg width="18" height="18" viewBox="0 0 18 18" fill="none">
+      <path d="M4 4.5h10M9 4.5V14" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
+    </svg>
+  );
+}
+function IconRuler() {
+  return (
+    <svg width="18" height="18" viewBox="0 0 18 18" fill="none">
+      <rect x="2.5" y="6.5" width="13" height="5" rx="0.8" stroke="currentColor" strokeWidth="1.4" />
+      <path d="M5 6.5V9M8 6.5V9M11 6.5V9M14 6.5V9" stroke="currentColor" strokeWidth="1.2" />
+    </svg>
+  );
+}
+function IconMeasureTool() {
+  return (
+    <svg width="18" height="18" viewBox="0 0 18 18" fill="none">
+      <path d="M3 15L15 3" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
+      <circle cx="3" cy="15" r="1.6" fill="currentColor" />
+      <circle cx="15" cy="3" r="1.6" fill="currentColor" />
+      <path d="M8 10l1.5-1.5M10 8l1.5-1.5" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" />
     </svg>
   );
 }
@@ -230,6 +255,8 @@ export default function Toolbar({
   setColor,
   ortho,
   setOrtho,
+  showDimensions,
+  setShowDimensions,
   onExportPdf,
   onNewBoard,
   panelOpen,
@@ -251,6 +278,8 @@ export default function Toolbar({
   setColor: (c: LineColor) => void;
   ortho: boolean;
   setOrtho: (v: boolean) => void;
+  showDimensions: boolean;
+  setShowDimensions: (v: boolean) => void;
   onExportPdf: () => void;
   onNewBoard: () => void | Promise<void>;
   panelOpen: boolean;
@@ -292,6 +321,9 @@ export default function Toolbar({
         <ToolButton active={tool === "line"} onClick={() => setTool("line")} label="Línea de medida">
           <IconLine />
         </ToolButton>
+        <ToolButton active={tool === "ruler"} onClick={() => setTool("ruler")} label="Regla (mide sin dejar muro)">
+          <IconMeasureTool />
+        </ToolButton>
         <ToolButton active={tool === "rect"} onClick={() => setTool("rect")} label="Rectángulo">
           <IconRect />
         </ToolButton>
@@ -303,6 +335,9 @@ export default function Toolbar({
         </ToolButton>
         <ToolButton active={tool === "note"} onClick={() => setTool("note")} label="Nota a mano alzada">
           <IconNote />
+        </ToolButton>
+        <ToolButton active={tool === "text"} onClick={() => setTool("text")} label="Texto">
+          <IconText />
         </ToolButton>
       </div>
 
@@ -316,7 +351,7 @@ export default function Toolbar({
         <ToolButton active={tool === "eraser"} onClick={() => setTool("eraser")} label="Goma">
           <IconEraser />
         </ToolButton>
-        <ToolButton active={tool === "area"} onClick={() => setTool("area")} label="Sacar área (toca vértices)">
+        <ToolButton active={tool === "area"} onClick={() => setTool("area")} label="Sacar área (puntos o líneas)">
           <IconArea />
         </ToolButton>
         <ToolButton active={tool === "pan"} onClick={() => setTool("pan")} label="Mover lienzo">
@@ -350,7 +385,7 @@ export default function Toolbar({
         </button>
       </div>
 
-      {(tool === "line" || tool === "rect" || tool === "ellipse" || tool === "note") && (
+      {(tool === "line" || tool === "rect" || tool === "ellipse" || tool === "note" || tool === "text") && (
         <div className="flex items-center gap-1">
           {PEN_COLORS.map((c) => (
             <button
@@ -366,17 +401,31 @@ export default function Toolbar({
         </div>
       )}
 
-      <button
-        type="button"
-        onClick={() => setOrtho(!ortho)}
-        aria-pressed={ortho}
-        className={`rounded-md border px-2.5 py-1.5 font-mono text-xs ${
-          ortho ? "border-accent bg-accent-bg text-accent" : "border-line bg-card text-ink-soft"
-        }`}
-        title="Fuerza las líneas nuevas a quedar horizontales o verticales"
-      >
-        Guía recta
-      </button>
+      <div className="flex items-center gap-1">
+        <button
+          type="button"
+          onClick={() => setOrtho(!ortho)}
+          aria-pressed={ortho}
+          className={`rounded-md border px-2.5 py-1.5 font-mono text-xs ${
+            ortho ? "border-accent bg-accent-bg text-accent" : "border-line bg-card text-ink-soft"
+          }`}
+          title="Fuerza las líneas y el estirado a quedar horizontales o verticales"
+        >
+          Guía recta
+        </button>
+        <button
+          type="button"
+          onClick={() => setShowDimensions(!showDimensions)}
+          aria-pressed={showDimensions}
+          className={`flex h-9 items-center gap-1 rounded-md border px-2.5 font-mono text-xs ${
+            showDimensions ? "border-line bg-card text-ink-soft" : "border-accent bg-accent-bg text-accent"
+          }`}
+          title="Mostrar u ocultar las medidas mientras dibujas"
+        >
+          <IconRuler />
+          Medidas
+        </button>
+      </div>
 
       <div className="ml-auto flex items-center gap-2">
         <span className="hidden font-mono text-xs text-ink-soft sm:inline">

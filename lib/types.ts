@@ -14,6 +14,10 @@ export type MeasureLine = {
   mid: Point;
   color: LineColor;
   value: string;
+  // Lines sharing a groupId (e.g. a rectangle's 4 edges) move together as
+  // one rigid shape when you drag any of their bodies — deleting one edge
+  // clears this on the rest, so they fall back to independent lines.
+  groupId?: string;
 };
 
 export type NoteStroke = {
@@ -42,7 +46,40 @@ export type SymbolInstance = {
   y: number;
   angle: number; // radians
   length: number; // meters, along `angle` from (x,y)
+  depth?: number; // windows only: short (wall-thickness) dimension, meters
+  frameDepth?: number; // doors only: wall-thickness fit for the frame ticks, meters
+  mirror?: 1 | -1; // doors only: which side the leaf swings to
   color: LineColor;
+};
+
+export type EllipseZone = {
+  id: string;
+  cx: number;
+  cy: number;
+  rx: number;
+  ry: number;
+  color: LineColor;
+};
+
+export type TextLabel = {
+  id: string;
+  x: number;
+  y: number;
+  text: string;
+  color: LineColor;
+};
+
+// A reference plan (photo/scan) traced under the drawing. Position/size are
+// world-space (meters); the user drags/resizes it against the grid to
+// calibrate it by eye, then locks it so it stops being grabbed by accident.
+export type BoardBackground = {
+  dataUrl: string;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  opacity: number;
+  locked: boolean;
 };
 
 export type BoardState = {
@@ -54,6 +91,9 @@ export type BoardState = {
   notes: NoteStroke[];
   areas: AreaZone[];
   symbols: SymbolInstance[];
+  ellipses: EllipseZone[];
+  texts: TextLabel[];
+  background?: BoardBackground;
 };
 
 export type BoardMeta = {
@@ -80,7 +120,18 @@ export function newBoardId(): string {
 
 export function emptyBoard(id: string, name = "Levantamiento sin nombre"): BoardState {
   const now = Date.now();
-  return { id, name, createdAt: now, updatedAt: now, lines: [], notes: [], areas: [], symbols: [] };
+  return {
+    id,
+    name,
+    createdAt: now,
+    updatedAt: now,
+    lines: [],
+    notes: [],
+    areas: [],
+    symbols: [],
+    ellipses: [],
+    texts: [],
+  };
 }
 
 function straightMid(line: Pick<MeasureLine, "x1" | "y1" | "x2" | "y2">): Point {
