@@ -71,6 +71,20 @@ const TAP_THRESHOLD_PX = 8;
 const HISTORY_LIMIT = 50;
 const WALL_ALIGN_DIST = 0.5; // meters — how close a door/window has to get to a wall to snap onto it
 
+// Dimension text sized in WORLD units (constant / DEFAULT_SCALE) instead of
+// screen px (constant / current scale) — it grows and shrinks along with
+// the drawing itself as you zoom, instead of staying a fixed size that
+// overwhelms a zoomed-out plan or looks tiny against a zoomed-in one.
+const DIM_FONT_SIZE = 13 / DEFAULT_SCALE;
+const DIM_FONT_SIZE_SMALL = 12 / DEFAULT_SCALE;
+
+// This app measures in centimeters — world units stay meters internally
+// (geometry, grid, snapping), but every linear measurement is shown/typed
+// as a bare whole-number cm value ("un muro de 1 metro" reads as "100").
+function formatCm(meters: number): string {
+  return Math.round(meters * 100).toString();
+}
+
 type Tool = "line" | "curve" | "stretch" | "select" | "rect" | "ellipse" | "note" | "text" | "eraser" | "pan" | "area" | "ruler";
 
 type EditingValue = {
@@ -630,11 +644,12 @@ export default function CanvasBoard({ boardId }: { boardId: string }) {
       if (!fromLabel && (tool === "area" || tool === "curve" || tool === "stretch" || tool === "select" || tool === "text")) return;
       pushHistory();
       const mid = { x: (line.x1 + line.x2) / 2, y: (line.y1 + line.y2) / 2 };
+      const meters = parseFloat(line.value.replace(",", "."));
       setEditingValue({
         id: line.id,
         screenX: mid.x * scale + pos.x,
         screenY: mid.y * scale + pos.y,
-        value: line.value,
+        value: Number.isFinite(meters) ? formatCm(meters) : "",
         original: { x2: line.x2, y2: line.y2, mid: line.mid },
       });
     },
@@ -642,9 +657,13 @@ export default function CanvasBoard({ boardId }: { boardId: string }) {
   );
 
   const applyLiveValue = useCallback((id: string, value: string) => {
+    // Editor input is centimeters (this app's working unit); resizeLineToValue
+    // stores/measures in meters internally, so convert at this boundary.
+    const cm = parseFloat(value.replace(",", "."));
+    const metersStr = Number.isFinite(cm) ? (cm / 100).toString() : value;
     setBoard((b) => ({
       ...b,
-      lines: b.lines.map((l) => (l.id === id ? resizeLineToValue(l, value) : l)),
+      lines: b.lines.map((l) => (l.id === id ? resizeLineToValue(l, metersStr) : l)),
       updatedAt: Date.now(),
     }));
   }, []);
@@ -1218,7 +1237,7 @@ export default function CanvasBoard({ boardId }: { boardId: string }) {
       const projStart = (wallHit.lineStart.x - target.x) * forward.x + (wallHit.lineStart.y - target.y) * forward.y;
       const projEnd = (wallHit.lineEnd.x - target.x) * forward.x + (wallHit.lineEnd.y - target.y) * forward.y;
       const chosen = projStart >= projEnd ? wallHit.lineStart : wallHit.lineEnd;
-      setDoorHingeReadout({ x: target.x, y: target.y, text: `${distance(target, chosen).toFixed(2)} m` });
+      setDoorHingeReadout({ x: target.x, y: target.y, text: formatCm(distance(target, chosen)) });
     } else {
       setDoorHingeReadout(null);
     }
@@ -1289,7 +1308,7 @@ export default function CanvasBoard({ boardId }: { boardId: string }) {
         id: s.id,
         screenX: mid.x * scale + pos.x,
         screenY: mid.y * scale + pos.y,
-        value: s.length.toFixed(2),
+        value: formatCm(s.length),
       });
     },
     [tool, scale, pos]
@@ -1298,7 +1317,8 @@ export default function CanvasBoard({ boardId }: { boardId: string }) {
   const commitDoorWidth = useCallback(() => {
     setEditingDoorWidth((cur) => {
       if (!cur) return null;
-      const n = parseFloat(cur.value.replace(",", "."));
+      // Input is centimeters; `length` is stored in meters internally.
+      const n = parseFloat(cur.value.replace(",", ".")) / 100;
       if (Number.isFinite(n) && n > 0) {
         pushHistory();
         const length = Math.max(0.2, n);
@@ -1620,7 +1640,10 @@ export default function CanvasBoard({ boardId }: { boardId: string }) {
       />
 
       <div className="relative flex-1 min-h-0">
-        <div ref={containerRef} className="absolute inset-0">
+        {/* touch-action: none — without this, iOS still treats a single-finger
+            drag as a page-scroll/bounce gesture underneath Konva's own touch
+            handling, which is what made freehand strokes come out broken. */}
+        <div ref={containerRef} className="absolute inset-0" style={{ touchAction: "none" }}>
           {stageSize.width > 0 && (
             <Stage
               ref={stageRef}
@@ -1644,12 +1667,17 @@ export default function CanvasBoard({ boardId }: { boardId: string }) {
               onMouseDown={handlePointerDown}
               onMouseMove={handlePointerMove}
               onMouseUp={handlePointerUp}
-              onTouchStart={handlePointerDown}
+              onTouchStart={(e) => {
+                e.evt.preventDefault();
+                handlePointerDown(e);
+              }}
               onTouchMove={(e) => {
+                e.evt.preventDefault();
                 if (e.evt.touches.length === 2) handleTouchMove(e);
                 else handlePointerMove();
               }}
               onTouchEnd={(e) => {
+                e.evt.preventDefault();
                 handleTouchEnd(e);
                 handlePointerUp();
               }}
@@ -1781,11 +1809,11 @@ export default function CanvasBoard({ boardId }: { boardId: string }) {
                           x={cx}
                           y={cy}
                           text={`${area.toFixed(2)} m²`}
-                          fontSize={13 / scale}
+                          fontSize={DIM_FONT_SIZE}
                           fontFamily="ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace"
                           fill="#1c1b1a"
                           align="center"
-                          offsetX={30 / scale}
+                          offsetX={30 / DEFAULT_SCALE}
                           listening={false}
                         />
                       )}
@@ -2104,11 +2132,11 @@ export default function CanvasBoard({ boardId }: { boardId: string }) {
                     x={doorHingeReadout.x}
                     y={doorHingeReadout.y}
                     text={doorHingeReadout.text}
-                    fontSize={12 / scale}
+                    fontSize={DIM_FONT_SIZE_SMALL}
                     fontFamily="ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace"
                     fill="#c2410c"
-                    padding={3 / scale}
-                    offsetY={26 / scale}
+                    padding={3 / DEFAULT_SCALE}
+                    offsetY={26 / DEFAULT_SCALE}
                     align="center"
                     listening={false}
                   />
@@ -2126,11 +2154,11 @@ export default function CanvasBoard({ boardId }: { boardId: string }) {
                     <Text
                       x={(drawingLine.start.x + drawingLine.end.x) / 2}
                       y={(drawingLine.start.y + drawingLine.end.y) / 2}
-                      text={`${distance(drawingLine.start, drawingLine.end).toFixed(2)} m`}
-                      fontSize={13 / scale}
+                      text={formatCm(distance(drawingLine.start, drawingLine.end))}
+                      fontSize={DIM_FONT_SIZE}
                       fontFamily="ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace"
                       fill="#c2410c"
-                      offsetY={18 / scale}
+                      offsetY={18 / DEFAULT_SCALE}
                       align="center"
                       listening={false}
                     />
@@ -2183,11 +2211,11 @@ export default function CanvasBoard({ boardId }: { boardId: string }) {
                         <Text
                           x={(ruler.start.x + (ruler.end ?? ruler.hover)!.x) / 2}
                           y={(ruler.start.y + (ruler.end ?? ruler.hover)!.y) / 2}
-                          text={`${distance(ruler.start, (ruler.end ?? ruler.hover)!).toFixed(2)} m`}
-                          fontSize={13 / scale}
+                          text={formatCm(distance(ruler.start, (ruler.end ?? ruler.hover)!))}
+                          fontSize={DIM_FONT_SIZE}
                           fontFamily="ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace"
                           fill="#c2410c"
-                          offsetY={18 / scale}
+                          offsetY={18 / DEFAULT_SCALE}
                           align="center"
                           listening={false}
                         />
@@ -2280,12 +2308,12 @@ export default function CanvasBoard({ boardId }: { boardId: string }) {
                         key={`${l.id}-label`}
                         x={mid.x}
                         y={mid.y}
-                        text={l.value ? `${l.value} m` : "…"}
-                        fontSize={13 / scale}
+                        text={l.value ? formatCm(parseFloat(l.value)) : "…"}
+                        fontSize={DIM_FONT_SIZE}
                         fontFamily="ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace"
                         fill={l.value ? "#1c1b1a" : "#a8a29e"}
-                        padding={3 / scale}
-                        offsetY={18 / scale}
+                        padding={3 / DEFAULT_SCALE}
+                        offsetY={18 / DEFAULT_SCALE}
                         align="center"
                         onClick={() => openValueEditor(l, true)}
                         onTap={() => openValueEditor(l, true)}
@@ -2306,13 +2334,13 @@ export default function CanvasBoard({ boardId }: { boardId: string }) {
                         key={`${s.id}-label`}
                         x={mid.x + perp.x * offset}
                         y={mid.y + perp.y * offset}
-                        text={`${s.length.toFixed(2)} m`}
-                        fontSize={12 / scale}
+                        text={formatCm(s.length)}
+                        fontSize={DIM_FONT_SIZE_SMALL}
                         fontFamily="ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace"
                         fill={isDoor ? "#1c1b1a" : "#78716c"}
-                        padding={isDoor ? 2 / scale : 0}
+                        padding={isDoor ? 2 / DEFAULT_SCALE : 0}
                         align="center"
-                        offsetX={20 / scale}
+                        offsetX={20 / DEFAULT_SCALE}
                         listening={isDoor}
                         onClick={isDoor ? () => openDoorWidthEditor(s) : undefined}
                         onTap={isDoor ? () => openDoorWidthEditor(s) : undefined}
@@ -2356,7 +2384,7 @@ export default function CanvasBoard({ boardId }: { boardId: string }) {
           >
             <input
               autoFocus
-              inputMode="decimal"
+              inputMode="numeric"
               value={editingValue.value}
               onChange={(e) => {
                 const value = e.target.value;
@@ -2368,7 +2396,7 @@ export default function CanvasBoard({ boardId }: { boardId: string }) {
                 if (e.key === "Escape") cancelEditingValue();
               }}
               onBlur={commitEditingValue}
-              placeholder="metros"
+              placeholder="cm"
               className="w-24 rounded-md border-2 border-accent bg-white px-2 py-1 text-center font-mono text-sm text-ink shadow-lg outline-none"
             />
           </div>
@@ -2404,7 +2432,7 @@ export default function CanvasBoard({ boardId }: { boardId: string }) {
           >
             <input
               autoFocus
-              inputMode="decimal"
+              inputMode="numeric"
               value={editingDoorWidth.value}
               onChange={(e) => {
                 const value = e.target.value;
@@ -2415,7 +2443,7 @@ export default function CanvasBoard({ boardId }: { boardId: string }) {
                 if (e.key === "Escape") cancelDoorWidth();
               }}
               onBlur={commitDoorWidth}
-              placeholder="metros"
+              placeholder="cm"
               className="w-24 rounded-md border-2 border-accent bg-white px-2 py-1 text-center font-mono text-sm text-ink shadow-lg outline-none"
             />
           </div>
