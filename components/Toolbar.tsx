@@ -4,7 +4,7 @@ import { useEffect, useState } from "react";
 import Link from "next/link";
 import { PEN_COLORS, type LineColor } from "@/lib/types";
 
-type Tool = "line" | "curve" | "stretch" | "select" | "rect" | "ellipse" | "note" | "text" | "eraser" | "pan" | "area" | "ruler";
+type Tool = "line" | "curve" | "stretch" | "select" | "rect" | "ellipse" | "note" | "text" | "eraser" | "pan" | "area" | "ruler" | "lasso";
 
 const COLOR_NAMES: Record<LineColor, string> = {
   "#1c1b1a": "Negro",
@@ -100,6 +100,20 @@ function IconSelect() {
         fill="currentColor"
         fillOpacity="0.15"
       />
+    </svg>
+  );
+}
+function IconLasso() {
+  return (
+    <svg width="18" height="18" viewBox="0 0 18 18" fill="none">
+      <path
+        d="M9.2 2.8c-3.6 0-6.2 2.3-6.2 5 0 2.2 1.7 4 4.2 4.6-.5.5-.8 1-.8 1.5 0 1 1 1.6 2.1 1.6.8 0 1.5-.3 1.9-.8"
+        stroke="currentColor"
+        strokeWidth="1.5"
+        strokeLinecap="round"
+        strokeDasharray="2.2 2"
+      />
+      <circle cx="9.6" cy="14" r="1.3" fill="currentColor" />
     </svg>
   );
 }
@@ -313,7 +327,7 @@ export default function Toolbar({
         value={name}
         onChange={(e) => setName(e.target.value)}
         onBlur={() => onRenameBoard(name.trim() || "Levantamiento sin nombre")}
-        className="min-w-0 flex-shrink basis-36 rounded-md border border-transparent bg-transparent px-1.5 py-1 font-display text-sm font-semibold text-ink outline-none hover:border-line focus:border-line"
+        className="min-w-0 flex-shrink basis-36 rounded-md border border-transparent bg-transparent px-1.5 py-1 font-display text-base font-semibold text-ink outline-none hover:border-line focus:border-line"
         placeholder="Nombre del levantamiento"
       />
 
@@ -344,6 +358,9 @@ export default function Toolbar({
       <div className="flex items-center gap-1">
         <ToolButton active={tool === "select"} onClick={() => setTool("select")} label="Seleccionar línea">
           <IconSelect />
+        </ToolButton>
+        <ToolButton active={tool === "lasso"} onClick={() => setTool("lasso")} label="Lazo (selecciona varios y agranda/achica con dos dedos)">
+          <IconLasso />
         </ToolButton>
         <ToolButton active={tool === "stretch"} onClick={() => setTool("stretch")} label="Estirar (arrastra un punto o una línea)">
           <IconStretch />

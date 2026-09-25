@@ -67,6 +67,10 @@ export type TextLabel = {
   y: number;
   text: string;
   color: LineColor;
+  // World-space size (like the dimension font constants) — undefined falls
+  // back to the original fixed screen size for texts placed before this was
+  // adjustable. Set by pinching the label with two fingers.
+  fontSize?: number;
 };
 
 // A reference plan (photo/scan) traced under the drawing. Position/size are

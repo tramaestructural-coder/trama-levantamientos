@@ -93,7 +93,9 @@ export default function LayersPanel({
                   onChange={(e) => onUpdateValue(line.id, e.target.value)}
                   placeholder="—"
                   inputMode="decimal"
-                  className="w-16 flex-shrink-0 rounded border border-line bg-paper px-1.5 py-1 text-center font-mono text-xs text-ink outline-none focus:border-accent"
+                  // text-base, not text-xs — under 16px, iOS auto-zooms the
+                  // page on focus (see CanvasBoard.tsx's editingValue input).
+                  className="w-20 flex-shrink-0 rounded border border-line bg-paper px-1.5 py-1 text-center font-mono text-base text-ink outline-none focus:border-accent"
                 />
                 <span className="flex-1 truncate font-mono text-[11px] text-ink-faint">
                   {conns.length ? `conecta L${conns.join(", L")}` : ""}

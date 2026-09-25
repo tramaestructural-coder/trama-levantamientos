@@ -14,6 +14,7 @@ import {
   findSnapPoint,
   findWallAlignment,
   makeId,
+  pointInPolygon,
   polygonArea,
   projectOntoSegment,
   resizeEndpointTarget,
@@ -47,6 +48,7 @@ import {
   type EllipseZone,
   type LineColor,
   type MeasureLine,
+  type NoteStroke,
   type SymbolInstance,
   type TextLabel,
 } from "@/lib/types";
@@ -77,8 +79,8 @@ const WALL_ALIGN_DIST = 0.5; // meters — how close a door/window has to get to
 // overwhelms a zoomed-out plan or looks tiny against a zoomed-in one. Kept
 // small so tightly-packed dimensions (e.g. several short wall segments)
 // don't crowd each other out.
-const DIM_FONT_SIZE = 10 / DEFAULT_SCALE;
-const DIM_FONT_SIZE_SMALL = 9 / DEFAULT_SCALE;
+const DIM_FONT_SIZE = 7 / DEFAULT_SCALE;
+const DIM_FONT_SIZE_SMALL = 6.5 / DEFAULT_SCALE;
 
 // This app measures in centimeters — world units stay meters internally
 // (geometry, grid, snapping), but every linear measurement is shown/typed
@@ -98,7 +100,211 @@ function dimOffsetX(text: string, fontSize: number): number {
   return (text.length * fontSize * DIM_CHAR_WIDTH_RATIO) / 2;
 }
 
-type Tool = "line" | "curve" | "stretch" | "select" | "rect" | "ellipse" | "note" | "text" | "eraser" | "pan" | "area" | "ruler";
+// Free-text labels' size, in the same world-scaled units as the dimension
+// constants above — at the default zoom this renders identically to the old
+// fixed 16px, but now it's a real stored number a pinch gesture can change.
+const DEFAULT_TEXT_FONT_SIZE = 16 / DEFAULT_SCALE;
+const TEXT_PINCH_HIT_RADIUS = 40; // screen px — how close a 2-finger touch must land to a text label to resize it instead of zooming the canvas
+const LASSO_BBOX_MARGIN = 20; // screen px — how far outside a lasso selection's box a pinch can still start and count as scaling it
+const PINCH_SCALE_MIN = 0.15;
+const PINCH_SCALE_MAX = 8;
+
+// Ids of everything a lasso loop (or a text tap) currently has selected,
+// grouped by the board array it lives in — an element only ever appears in
+// its own array, so "is anything selected" is just "is every array empty".
+type LassoSelection = {
+  lines: string[];
+  areas: string[];
+  symbols: string[];
+  ellipses: string[];
+  texts: string[];
+  notes: string[];
+};
+
+function emptyLassoSelection(): LassoSelection {
+  return { lines: [], areas: [], symbols: [], ellipses: [], texts: [], notes: [] };
+}
+
+function lassoSelectionIsEmpty(sel: LassoSelection): boolean {
+  return !sel.lines.length && !sel.areas.length && !sel.symbols.length && !sel.ellipses.length && !sel.texts.length && !sel.notes.length;
+}
+
+// Which elements a freehand loop captured — tested against a single
+// representative point per element (a line's midpoint, a shape's center)
+// rather than full containment, so a rough lasso still picks things up.
+function computeLassoSelection(board: BoardState, polygon: Point[]): LassoSelection {
+  const sel = emptyLassoSelection();
+  if (polygon.length < 3) return sel;
+  board.lines.forEach((l) => {
+    if (pointInPolygon(l.mid, polygon)) sel.lines.push(l.id);
+  });
+  board.areas.forEach((a) => {
+    const cx = a.points.reduce((s, p) => s + p.x, 0) / a.points.length;
+    const cy = a.points.reduce((s, p) => s + p.y, 0) / a.points.length;
+    if (pointInPolygon({ x: cx, y: cy }, polygon)) sel.areas.push(a.id);
+  });
+  board.symbols.forEach((s) => {
+    if (pointInPolygon({ x: s.x, y: s.y }, polygon)) sel.symbols.push(s.id);
+  });
+  board.ellipses.forEach((el) => {
+    if (pointInPolygon({ x: el.cx, y: el.cy }, polygon)) sel.ellipses.push(el.id);
+  });
+  board.texts.forEach((t) => {
+    if (pointInPolygon({ x: t.x, y: t.y }, polygon)) sel.texts.push(t.id);
+  });
+  board.notes.forEach((n) => {
+    let sx = 0;
+    let sy = 0;
+    let count = 0;
+    for (let i = 0; i < n.points.length; i += 2) {
+      sx += n.points[i];
+      sy += n.points[i + 1];
+      count += 1;
+    }
+    if (count && pointInPolygon({ x: sx / count, y: sy / count }, polygon)) sel.notes.push(n.id);
+  });
+  return sel;
+}
+
+// The world-space box the selection currently occupies — recomputed from
+// live board state each render, so it tracks the elements as they scale.
+function computeSelectionBBox(board: BoardState, sel: LassoSelection): { minX: number; minY: number; maxX: number; maxY: number } | null {
+  let minX = Infinity;
+  let minY = Infinity;
+  let maxX = -Infinity;
+  let maxY = -Infinity;
+  const extend = (x: number, y: number) => {
+    if (x < minX) minX = x;
+    if (y < minY) minY = y;
+    if (x > maxX) maxX = x;
+    if (y > maxY) maxY = y;
+  };
+  board.lines.forEach((l) => {
+    if (!sel.lines.includes(l.id)) return;
+    extend(l.x1, l.y1);
+    extend(l.x2, l.y2);
+  });
+  board.areas.forEach((a) => {
+    if (!sel.areas.includes(a.id)) return;
+    a.points.forEach((p) => extend(p.x, p.y));
+  });
+  board.symbols.forEach((s) => {
+    if (!sel.symbols.includes(s.id)) return;
+    if (s.kind === "door") {
+      const g = doorGeometry(s);
+      extend(g.hinge.x, g.hinge.y);
+      extend(g.closedEnd.x, g.closedEnd.y);
+      extend(g.openEnd.x, g.openEnd.y);
+    } else {
+      windowGeometry(s).corners.forEach((c) => extend(c.x, c.y));
+    }
+  });
+  board.ellipses.forEach((el) => {
+    if (!sel.ellipses.includes(el.id)) return;
+    extend(el.cx - el.rx, el.cy - el.ry);
+    extend(el.cx + el.rx, el.cy + el.ry);
+  });
+  board.texts.forEach((t) => {
+    if (!sel.texts.includes(t.id)) return;
+    extend(t.x, t.y);
+  });
+  board.notes.forEach((n) => {
+    if (!sel.notes.includes(n.id)) return;
+    for (let i = 0; i < n.points.length; i += 2) extend(n.points[i], n.points[i + 1]);
+  });
+  if (!Number.isFinite(minX)) return null;
+  return { minX, minY, maxX, maxY };
+}
+
+function scalePointAround(anchor: Point, p: Point, k: number): Point {
+  return { x: anchor.x + (p.x - anchor.x) * k, y: anchor.y + (p.y - anchor.y) * k };
+}
+
+// Frozen copies of exactly the selected elements, taken once when a pinch
+// gesture starts — every subsequent frame scales from this fixed snapshot
+// (not from the previous frame's already-scaled result), so the transform
+// is a clean function of the live finger distance instead of compounding
+// rounding error over many small steps.
+type SelectionSnapshot = {
+  lines: Map<string, MeasureLine>;
+  areas: Map<string, AreaZone>;
+  symbols: Map<string, SymbolInstance>;
+  ellipses: Map<string, EllipseZone>;
+  texts: Map<string, TextLabel>;
+  notes: Map<string, NoteStroke>;
+};
+
+function snapshotSelection(board: BoardState, sel: LassoSelection): SelectionSnapshot {
+  return {
+    lines: new Map(board.lines.filter((l) => sel.lines.includes(l.id)).map((l) => [l.id, l])),
+    areas: new Map(board.areas.filter((a) => sel.areas.includes(a.id)).map((a) => [a.id, a])),
+    symbols: new Map(board.symbols.filter((s) => sel.symbols.includes(s.id)).map((s) => [s.id, s])),
+    ellipses: new Map(board.ellipses.filter((el) => sel.ellipses.includes(el.id)).map((el) => [el.id, el])),
+    texts: new Map(board.texts.filter((t) => sel.texts.includes(t.id)).map((t) => [t.id, t])),
+    notes: new Map(board.notes.filter((n) => sel.notes.includes(n.id)).map((n) => [n.id, n])),
+  };
+}
+
+// Applies a uniform scale by `k` around `anchor` (world coords) to every
+// element in `snapshot`, writing the result onto the current board. A
+// single anchor + uniform k keeps curves and rotated door/window angles
+// geometrically consistent — see scalePointAround.
+function applyGroupScale(board: BoardState, snapshot: SelectionSnapshot, anchor: Point, k: number): BoardState {
+  return {
+    ...board,
+    lines: board.lines.map((l) => {
+      const orig = snapshot.lines.get(l.id);
+      if (!orig) return l;
+      const p1 = scalePointAround(anchor, { x: orig.x1, y: orig.y1 }, k);
+      const p2 = scalePointAround(anchor, { x: orig.x2, y: orig.y2 }, k);
+      const mid = scalePointAround(anchor, orig.mid, k);
+      return { ...l, x1: p1.x, y1: p1.y, x2: p2.x, y2: p2.y, mid };
+    }),
+    areas: board.areas.map((a) => {
+      const orig = snapshot.areas.get(a.id);
+      if (!orig) return a;
+      return { ...a, points: orig.points.map((p) => scalePointAround(anchor, p, k)) };
+    }),
+    symbols: board.symbols.map((s) => {
+      const orig = snapshot.symbols.get(s.id);
+      if (!orig) return s;
+      const p = scalePointAround(anchor, { x: orig.x, y: orig.y }, k);
+      return {
+        ...s,
+        x: p.x,
+        y: p.y,
+        length: orig.length * k,
+        depth: orig.depth !== undefined ? orig.depth * k : undefined,
+        frameDepth: orig.frameDepth !== undefined ? orig.frameDepth * k : undefined,
+      };
+    }),
+    ellipses: board.ellipses.map((el) => {
+      const orig = snapshot.ellipses.get(el.id);
+      if (!orig) return el;
+      const p = scalePointAround(anchor, { x: orig.cx, y: orig.cy }, k);
+      return { ...el, cx: p.x, cy: p.y, rx: orig.rx * k, ry: orig.ry * k };
+    }),
+    texts: board.texts.map((t) => {
+      const orig = snapshot.texts.get(t.id);
+      if (!orig) return t;
+      const p = scalePointAround(anchor, { x: orig.x, y: orig.y }, k);
+      return { ...t, x: p.x, y: p.y, fontSize: (orig.fontSize ?? DEFAULT_TEXT_FONT_SIZE) * k };
+    }),
+    notes: board.notes.map((n) => {
+      const orig = snapshot.notes.get(n.id);
+      if (!orig) return n;
+      const points: number[] = [];
+      for (let i = 0; i < orig.points.length; i += 2) {
+        const sp = scalePointAround(anchor, { x: orig.points[i], y: orig.points[i + 1] }, k);
+        points.push(sp.x, sp.y);
+      }
+      return { ...n, points };
+    }),
+    updatedAt: Date.now(),
+  };
+}
+
+type Tool = "line" | "curve" | "stretch" | "select" | "rect" | "ellipse" | "note" | "text" | "eraser" | "pan" | "area" | "ruler" | "lasso";
 
 type EditingValue = {
   id: string;
@@ -182,11 +388,14 @@ export default function CanvasBoard({ boardId }: { boardId: string }) {
   );
   const [editingDoorWidth, setEditingDoorWidth] = useState<{ id: string; screenX: number; screenY: number; value: string } | null>(null);
   const [doorHingeReadout, setDoorHingeReadout] = useState<{ x: number; y: number; text: string } | null>(null);
+  const [lassoPoints, setLassoPoints] = useState<Point[] | null>(null);
+  const [lassoSelection, setLassoSelection] = useState<LassoSelection | null>(null);
 
   const stageRef = useRef<Konva.Stage>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const hasFitRef = useRef(false);
   const pinchRef = useRef<{ dist: number; center: Point; scale: number; pos: Point } | null>(null);
+  const objectPinchRef = useRef<{ selection: LassoSelection; anchor: Point; dist: number; snapshot: SelectionSnapshot } | null>(null);
   const stretchOriginRef = useRef<Point | null>(null);
   const stretchDragStartRef = useRef<Point | null>(null);
   const stretchConnectionsRef = useRef<{
@@ -230,6 +439,8 @@ export default function CanvasBoard({ boardId }: { boardId: string }) {
   const backgroundImage = useHtmlImage(board.background?.dataUrl);
 
   const setTool = useCallback((t: Tool) => {
+    setDrawingLine(null);
+    setDrawingNote(null);
     setDrawingArea(null);
     setDrawingAreaChain(null);
     setDrawingBox(null);
@@ -240,6 +451,9 @@ export default function CanvasBoard({ boardId }: { boardId: string }) {
     setDoorHingeReadout(null);
     setLineAlignGuides(null);
     setRuler(null);
+    setLassoPoints(null);
+    setLassoSelection(null);
+    objectPinchRef.current = null;
     setToolRaw(t);
   }, []);
 
@@ -493,6 +707,12 @@ export default function CanvasBoard({ boardId }: { boardId: string }) {
           snapToGrid(world, GRID_SNAP_PX / scale, gridStep) ??
           world;
         setRuler((prev) => (!prev || prev.end ? { start: snapped, end: null, hover: null } : { start: prev.start, end: snapped, hover: null }));
+      } else if (tool === "lasso") {
+        // Starting a new loop always clears whatever was selected before —
+        // a plain tap (path never grows past this single point) just clears
+        // it, which doubles as "tap empty space to deselect".
+        setLassoSelection(null);
+        setLassoPoints([world]);
       }
     },
     [tool, areaMode, scale, toWorld, allEndpoints, board.lines, gridStep, finalizeArea]
@@ -538,8 +758,10 @@ export default function CanvasBoard({ boardId }: { boardId: string }) {
       let hover = vertexSnap ?? snapToGrid(world, GRID_SNAP_PX / scale, gridStep) ?? world;
       if (ortho) hover = snapToAxis(ruler.start, hover);
       setRuler({ start: ruler.start, end: null, hover });
+    } else if (tool === "lasso" && lassoPoints) {
+      setLassoPoints([...lassoPoints, world]);
     }
-  }, [tool, drawingLine, drawingBox, drawingNote, ruler, ortho, scale, toWorld, allEndpoints, board.lines, gridStep]);
+  }, [tool, drawingLine, drawingBox, drawingNote, ruler, lassoPoints, ortho, scale, toWorld, allEndpoints, board.lines, gridStep]);
 
   const handlePointerUp = useCallback(() => {
     if (tool === "line" && drawingLine) {
@@ -615,8 +837,14 @@ export default function CanvasBoard({ boardId }: { boardId: string }) {
         const screen = { x: world.x * scale + pos.x, y: world.y * scale + pos.y };
         setEditingText({ id: null, screenX: screen.x, screenY: screen.y, x: world.x, y: world.y, value: "" });
       }
+    } else if (tool === "lasso" && lassoPoints) {
+      if (lassoPoints.length >= 3) {
+        const sel = computeLassoSelection(boardRef.current, lassoPoints);
+        setLassoSelection(lassoSelectionIsEmpty(sel) ? null : sel);
+      }
+      setLassoPoints(null);
     }
-  }, [tool, drawingLine, drawingBox, drawingNote, color, scale, pos, toWorld, pushHistory]);
+  }, [tool, drawingLine, drawingBox, drawingNote, lassoPoints, color, scale, pos, toWorld, pushHistory]);
 
   const handleEraseShape = useCallback(
     (id: string, kind: "measure" | "note" | "area" | "symbol" | "ellipse" | "text") => {
@@ -1472,30 +1700,86 @@ export default function CanvasBoard({ boardId }: { boardId: string }) {
       const dist = touchDistance(p1, p2);
       const center = touchCenter(p1, p2);
 
-      if (!pinchRef.current) {
-        pinchRef.current = { dist, center, scale, pos };
-        setDrawingLine(null);
-        setDrawingNote(null);
+      // A pinch already in progress keeps doing whatever it started as —
+      // scaling the lasso selection / a text label, or zooming the canvas —
+      // regardless of how the finger center drifts afterward.
+      if (objectPinchRef.current) {
+        const g = objectPinchRef.current;
+        const k = clamp(dist / g.dist, PINCH_SCALE_MIN, PINCH_SCALE_MAX);
+        setBoard((b) => applyGroupScale(b, g.snapshot, g.anchor, k));
         return;
       }
-      const start = pinchRef.current;
-      const newScale = clamp(start.scale * (dist / start.dist), MIN_SCALE, MAX_SCALE);
-      const worldAtCenter = {
-        x: (start.center.x - start.pos.x) / start.scale,
-        y: (start.center.y - start.pos.y) / start.scale,
-      };
-      const newPos = {
-        x: center.x - worldAtCenter.x * newScale,
-        y: center.y - worldAtCenter.y * newScale,
-      };
-      setScale(newScale);
-      setPos(clampPos(newPos, newScale));
+      if (pinchRef.current) {
+        const start = pinchRef.current;
+        const newScale = clamp(start.scale * (dist / start.dist), MIN_SCALE, MAX_SCALE);
+        const worldAtCenter = {
+          x: (start.center.x - start.pos.x) / start.scale,
+          y: (start.center.y - start.pos.y) / start.scale,
+        };
+        const newPos = {
+          x: center.x - worldAtCenter.x * newScale,
+          y: center.y - worldAtCenter.y * newScale,
+        };
+        setScale(newScale);
+        setPos(clampPos(newPos, newScale));
+        return;
+      }
+
+      // First frame of a fresh 2-finger gesture — decide what it targets,
+      // in priority order: an active lasso selection's box, a text label
+      // under the fingers, or (the default) zooming the whole canvas.
+      setDrawingLine(null);
+      setDrawingNote(null);
+      setLassoPoints(null);
+      const worldCenter = toWorld(center);
+      const board = boardRef.current;
+
+      if (lassoSelection && !lassoSelectionIsEmpty(lassoSelection)) {
+        const bbox = computeSelectionBBox(board, lassoSelection);
+        if (bbox) {
+          const margin = LASSO_BBOX_MARGIN / scale;
+          const inside =
+            worldCenter.x >= bbox.minX - margin &&
+            worldCenter.x <= bbox.maxX + margin &&
+            worldCenter.y >= bbox.minY - margin &&
+            worldCenter.y <= bbox.maxY + margin;
+          if (inside) {
+            pushHistory();
+            objectPinchRef.current = {
+              selection: lassoSelection,
+              anchor: { x: (bbox.minX + bbox.maxX) / 2, y: (bbox.minY + bbox.maxY) / 2 },
+              dist,
+              snapshot: snapshotSelection(board, lassoSelection),
+            };
+            return;
+          }
+        }
+      }
+
+      const hitRadius = TEXT_PINCH_HIT_RADIUS / scale;
+      const hitText = board.texts.find((t) => distance(worldCenter, { x: t.x, y: t.y }) <= hitRadius);
+      if (hitText) {
+        pushHistory();
+        const sel: LassoSelection = { ...emptyLassoSelection(), texts: [hitText.id] };
+        objectPinchRef.current = {
+          selection: sel,
+          anchor: { x: hitText.x, y: hitText.y },
+          dist,
+          snapshot: snapshotSelection(board, sel),
+        };
+        return;
+      }
+
+      pinchRef.current = { dist, center, scale, pos };
     },
-    [scale, pos, clampPos]
+    [scale, pos, toWorld, clampPos, lassoSelection, pushHistory]
   );
 
   const handleTouchEnd = useCallback((e: KonvaEventObject<TouchEvent>) => {
-    if (e.evt.touches.length < 2) pinchRef.current = null;
+    if (e.evt.touches.length < 2) {
+      pinchRef.current = null;
+      objectPinchRef.current = null;
+    }
   }, []);
 
   // --- board actions -------------------------------------------------------
@@ -2277,6 +2561,40 @@ export default function CanvasBoard({ boardId }: { boardId: string }) {
                   />
                 )}
 
+                {lassoPoints && lassoPoints.length > 1 && (
+                  <Line
+                    points={flatten(lassoPoints)}
+                    closed
+                    stroke="#2563eb"
+                    strokeWidth={1.5 / scale}
+                    dash={[6 / scale, 5 / scale]}
+                    fill="#2563eb"
+                    opacity={0.5}
+                    fillEnabled
+                    listening={false}
+                  />
+                )}
+
+                {lassoSelection &&
+                  !lassoSelectionIsEmpty(lassoSelection) &&
+                  (() => {
+                    const bbox = computeSelectionBBox(board, lassoSelection);
+                    if (!bbox) return null;
+                    const padding = 14 / scale;
+                    return (
+                      <Rect
+                        x={bbox.minX - padding}
+                        y={bbox.minY - padding}
+                        width={bbox.maxX - bbox.minX + padding * 2}
+                        height={bbox.maxY - bbox.minY + padding * 2}
+                        stroke="#2563eb"
+                        strokeWidth={1.5 / scale}
+                        dash={[7 / scale, 5 / scale]}
+                        listening={false}
+                      />
+                    );
+                  })()}
+
                 {uniqueVertices.map((v, i) => (
                   <Circle key={i} x={v.x} y={v.y} radius={3 / scale} fill="#78716c" listening={false} />
                 ))}
@@ -2378,10 +2696,10 @@ export default function CanvasBoard({ boardId }: { boardId: string }) {
                     x={t.x}
                     y={t.y}
                     text={t.text}
-                    fontSize={16 / scale}
+                    fontSize={t.fontSize ?? DEFAULT_TEXT_FONT_SIZE}
                     fontFamily="ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace"
                     fill={t.color}
-                    padding={2 / scale}
+                    padding={2 / DEFAULT_SCALE}
                     draggable={tool === "stretch" || tool === "select"}
                     onDragStart={() => handleTextDragStart(t)}
                     onDragMove={handleTextDragMove}
@@ -2421,7 +2739,12 @@ export default function CanvasBoard({ boardId }: { boardId: string }) {
               }}
               onBlur={commitEditingValue}
               placeholder="cm"
-              className="w-24 rounded-md border-2 border-accent bg-white px-2 py-1 text-center font-mono text-sm text-ink shadow-lg outline-none"
+              // text-base (16px), not text-sm — below 16px, iOS Safari
+              // auto-zooms the page on focus, and with zoom disabled in the
+              // viewport meta it gets stuck partway, desyncing where taps
+              // land from what's visually under your finger (this is what
+              // made taps land on the Capas button instead of the input).
+              className="w-24 rounded-md border-2 border-accent bg-white px-2 py-1 text-center font-mono text-base text-ink shadow-lg outline-none"
             />
           </div>
         )}
@@ -2444,7 +2767,7 @@ export default function CanvasBoard({ boardId }: { boardId: string }) {
               }}
               onBlur={commitEditingText}
               placeholder="texto"
-              className="min-w-[6rem] rounded-md border-2 border-accent bg-white px-2 py-1 text-sm text-ink shadow-lg outline-none"
+              className="min-w-[6rem] rounded-md border-2 border-accent bg-white px-2 py-1 text-base text-ink shadow-lg outline-none"
             />
           </div>
         )}
@@ -2468,7 +2791,7 @@ export default function CanvasBoard({ boardId }: { boardId: string }) {
               }}
               onBlur={commitDoorWidth}
               placeholder="cm"
-              className="w-24 rounded-md border-2 border-accent bg-white px-2 py-1 text-center font-mono text-sm text-ink shadow-lg outline-none"
+              className="w-24 rounded-md border-2 border-accent bg-white px-2 py-1 text-center font-mono text-base text-ink shadow-lg outline-none"
             />
           </div>
         )}

@@ -197,6 +197,23 @@ export function findAxisAlignment(
   return { point, guides };
 }
 
+// Ray-casting point-in-polygon test — used by the lasso select tool to
+// decide which elements a freehand loop captured (tested against each
+// element's own representative point: a line's midpoint, a shape's center).
+export function pointInPolygon(point: Point, polygon: Point[]): boolean {
+  if (polygon.length < 3) return false;
+  let inside = false;
+  for (let i = 0, j = polygon.length - 1; i < polygon.length; j = i++) {
+    const xi = polygon[i].x;
+    const yi = polygon[i].y;
+    const xj = polygon[j].x;
+    const yj = polygon[j].y;
+    const intersect = yi > point.y !== yj > point.y && point.x < ((xj - xi) * (point.y - yi)) / (yj - yi) + xi;
+    if (intersect) inside = !inside;
+  }
+  return inside;
+}
+
 // Shoelace formula. World units are meters, so this returns m² directly.
 export function polygonArea(points: Point[]): number {
   if (points.length < 3) return 0;
