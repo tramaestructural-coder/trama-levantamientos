@@ -4,7 +4,7 @@ import { useEffect, useState } from "react";
 import Link from "next/link";
 import { PEN_COLORS, type LineColor } from "@/lib/types";
 
-type Tool = "line" | "curve" | "stretch" | "select" | "rect" | "ellipse" | "note" | "text" | "eraser" | "pan" | "area" | "ruler" | "lasso";
+type Tool = "line" | "curve" | "stretch" | "select" | "rect" | "ellipse" | "note" | "text" | "eraser" | "pan" | "area" | "ruler" | "lasso" | "scale" | "move";
 
 const COLOR_NAMES: Record<LineColor, string> = {
   "#1c1b1a": "Negro",
@@ -114,6 +114,45 @@ function IconLasso() {
         strokeDasharray="2.2 2"
       />
       <circle cx="9.6" cy="14" r="1.3" fill="currentColor" />
+    </svg>
+  );
+}
+function IconScale() {
+  return (
+    <svg width="18" height="18" viewBox="0 0 18 18" fill="none">
+      <path
+        d="M3 11v4h4M15 7V3h-4M15 3 10 8M3 15l5-5"
+        stroke="currentColor"
+        strokeWidth="1.6"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+    </svg>
+  );
+}
+function IconMove() {
+  return (
+    <svg width="18" height="18" viewBox="0 0 18 18" fill="none">
+      <path
+        d="M9 2.5v13M2.5 9h13M9 2.5 6.8 4.7M9 2.5l2.2 2.2M9 15.5l-2.2-2.2M9 15.5l2.2-2.2M2.5 9l2.2-2.2M2.5 9l2.2 2.2M15.5 9l-2.2-2.2M15.5 9l-2.2 2.2"
+        stroke="currentColor"
+        strokeWidth="1.4"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+    </svg>
+  );
+}
+function IconTrash() {
+  return (
+    <svg width="16" height="16" viewBox="0 0 18 18" fill="none">
+      <path
+        d="M4 5.5h10M7.5 5.5V4a1 1 0 0 1 1-1h1a1 1 0 0 1 1 1v1.5M5.5 5.5 6.2 14a1 1 0 0 0 1 .9h3.6a1 1 0 0 0 1-.9l.7-8.5"
+        stroke="currentColor"
+        strokeWidth="1.4"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
     </svg>
   );
 }
@@ -283,6 +322,10 @@ export default function Toolbar({
   onRedo,
   canUndo,
   canRedo,
+  hasSelection,
+  onSelectionColor,
+  onSelectionDelete,
+  onSelectionClear,
 }: {
   boardName: string;
   onRenameBoard: (name: string) => void;
@@ -306,6 +349,10 @@ export default function Toolbar({
   onRedo: () => void;
   canUndo: boolean;
   canRedo: boolean;
+  hasSelection: boolean;
+  onSelectionColor: (c: LineColor) => void;
+  onSelectionDelete: () => void;
+  onSelectionClear: () => void;
 }) {
   const [name, setName] = useState(boardName);
 
@@ -314,7 +361,8 @@ export default function Toolbar({
   }, [boardName]);
 
   return (
-    <div className="z-30 flex flex-wrap items-center gap-x-3 gap-y-2 border-b border-line bg-card px-3 py-2">
+    <div className="z-30 border-b border-line bg-card">
+    <div className="flex flex-wrap items-center gap-x-3 gap-y-2 px-3 py-2">
       <Link
         href="/"
         aria-label="Volver a Levantamientos"
@@ -473,6 +521,49 @@ export default function Toolbar({
           Nuevo
         </button>
       </div>
+    </div>
+
+      {hasSelection && (
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-2 border-t border-line px-3 py-2">
+          <span className="font-mono text-[11px] uppercase tracking-wide text-ink-faint">Selección</span>
+          <div className="flex items-center gap-1">
+            <ToolButton active={tool === "scale"} onClick={() => setTool("scale")} label="Escalar la selección (arrastrá o pellizcá con dos dedos)">
+              <IconScale />
+            </ToolButton>
+            <ToolButton active={tool === "move"} onClick={() => setTool("move")} label="Mover la selección (arrastrá)">
+              <IconMove />
+            </ToolButton>
+          </div>
+          <div className="flex items-center gap-1">
+            {PEN_COLORS.map((c) => (
+              <button
+                key={c}
+                type="button"
+                onClick={() => onSelectionColor(c)}
+                aria-label={`Color ${COLOR_NAMES[c]}`}
+                title={COLOR_NAMES[c]}
+                className="h-6 w-6 rounded-full border-2 border-transparent"
+                style={{ backgroundColor: c }}
+              />
+            ))}
+          </div>
+          <button
+            type="button"
+            onClick={onSelectionDelete}
+            className="flex h-9 items-center gap-1.5 rounded-md border border-line bg-card px-2.5 font-mono text-xs text-red-600"
+          >
+            <IconTrash />
+            Eliminar
+          </button>
+          <button
+            type="button"
+            onClick={onSelectionClear}
+            className="ml-auto h-9 rounded-md border border-line bg-card px-2.5 font-mono text-xs text-ink-soft hover:text-ink"
+          >
+            Listo
+          </button>
+        </div>
+      )}
     </div>
   );
 }

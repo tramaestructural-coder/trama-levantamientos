@@ -102,12 +102,11 @@ function dimOffsetX(text: string, fontSize: number): number {
 
 // Free-text labels' size, in the same world-scaled units as the dimension
 // constants above — at the default zoom this renders identically to the old
-// fixed 16px, but now it's a real stored number a pinch gesture can change.
+// fixed 16px, but now it's a real stored number the "escalar" tool can change.
 const DEFAULT_TEXT_FONT_SIZE = 16 / DEFAULT_SCALE;
-const TEXT_PINCH_HIT_RADIUS = 40; // screen px — how close a 2-finger touch must land to a text label to resize it instead of zooming the canvas
-const LASSO_BBOX_MARGIN = 20; // screen px — how far outside a lasso selection's box a pinch can still start and count as scaling it
 const PINCH_SCALE_MIN = 0.15;
 const PINCH_SCALE_MAX = 8;
+const ERASER_CURSOR_RADIUS = 15; // screen px — matches roughly the hitStrokeWidth erasable shapes use
 
 // Ids of everything a lasso loop (or a text tap) currently has selected,
 // grouped by the board array it lives in — an element only ever appears in
@@ -258,7 +257,8 @@ function applyGroupScale(board: BoardState, snapshot: SelectionSnapshot, anchor:
       const p1 = scalePointAround(anchor, { x: orig.x1, y: orig.y1 }, k);
       const p2 = scalePointAround(anchor, { x: orig.x2, y: orig.y2 }, k);
       const mid = scalePointAround(anchor, orig.mid, k);
-      return { ...l, x1: p1.x, y1: p1.y, x2: p2.x, y2: p2.y, mid };
+      const length = distance(p1, p2);
+      return { ...l, x1: p1.x, y1: p1.y, x2: p2.x, y2: p2.y, mid, value: length > 0 ? length.toFixed(2) : l.value };
     }),
     areas: board.areas.map((a) => {
       const orig = snapshot.areas.get(a.id);
@@ -304,7 +304,97 @@ function applyGroupScale(board: BoardState, snapshot: SelectionSnapshot, anchor:
   };
 }
 
-type Tool = "line" | "curve" | "stretch" | "select" | "rect" | "ellipse" | "note" | "text" | "eraser" | "pan" | "area" | "ruler" | "lasso";
+// Rigid translate by `delta` (world units) — the "mover" tool's equivalent
+// of applyGroupScale, same snapshot-from-gesture-start pattern.
+function applyGroupTranslate(board: BoardState, snapshot: SelectionSnapshot, delta: Point): BoardState {
+  return {
+    ...board,
+    lines: board.lines.map((l) => {
+      const orig = snapshot.lines.get(l.id);
+      if (!orig) return l;
+      return {
+        ...l,
+        x1: orig.x1 + delta.x,
+        y1: orig.y1 + delta.y,
+        x2: orig.x2 + delta.x,
+        y2: orig.y2 + delta.y,
+        mid: { x: orig.mid.x + delta.x, y: orig.mid.y + delta.y },
+      };
+    }),
+    areas: board.areas.map((a) => {
+      const orig = snapshot.areas.get(a.id);
+      if (!orig) return a;
+      return { ...a, points: orig.points.map((p) => ({ x: p.x + delta.x, y: p.y + delta.y })) };
+    }),
+    symbols: board.symbols.map((s) => {
+      const orig = snapshot.symbols.get(s.id);
+      if (!orig) return s;
+      return { ...s, x: orig.x + delta.x, y: orig.y + delta.y };
+    }),
+    ellipses: board.ellipses.map((el) => {
+      const orig = snapshot.ellipses.get(el.id);
+      if (!orig) return el;
+      return { ...el, cx: orig.cx + delta.x, cy: orig.cy + delta.y };
+    }),
+    texts: board.texts.map((t) => {
+      const orig = snapshot.texts.get(t.id);
+      if (!orig) return t;
+      return { ...t, x: orig.x + delta.x, y: orig.y + delta.y };
+    }),
+    notes: board.notes.map((n) => {
+      const orig = snapshot.notes.get(n.id);
+      if (!orig) return n;
+      const points: number[] = [];
+      for (let i = 0; i < orig.points.length; i += 2) points.push(orig.points[i] + delta.x, orig.points[i + 1] + delta.y);
+      return { ...n, points };
+    }),
+    updatedAt: Date.now(),
+  };
+}
+
+// Recolors every element in `sel`, regardless of type — every board array's
+// element has its own `color` field.
+function applyRecolorSelection(board: BoardState, sel: LassoSelection, color: LineColor): BoardState {
+  return {
+    ...board,
+    lines: board.lines.map((l) => (sel.lines.includes(l.id) ? { ...l, color } : l)),
+    areas: board.areas.map((a) => (sel.areas.includes(a.id) ? { ...a, color } : a)),
+    symbols: board.symbols.map((s) => (sel.symbols.includes(s.id) ? { ...s, color } : s)),
+    ellipses: board.ellipses.map((el) => (sel.ellipses.includes(el.id) ? { ...el, color } : el)),
+    texts: board.texts.map((t) => (sel.texts.includes(t.id) ? { ...t, color } : t)),
+    notes: board.notes.map((n) => (sel.notes.includes(n.id) ? { ...n, color } : n)),
+    updatedAt: Date.now(),
+  };
+}
+
+// Deletes every element in `sel` — mirrors handleEraseShape's rectangle
+// groupId-breaking rule: an erased edge's surviving groupId siblings fall
+// back to independent lines instead of staying linked to a gone edge.
+function applyDeleteSelection(board: BoardState, sel: LassoSelection): BoardState {
+  const erasedGroupIds = new Set(
+    board.lines.filter((l) => sel.lines.includes(l.id) && l.groupId).map((l) => l.groupId as string)
+  );
+  return {
+    ...board,
+    lines: board.lines
+      .filter((l) => !sel.lines.includes(l.id))
+      .map((l) => (l.groupId && erasedGroupIds.has(l.groupId) ? { ...l, groupId: undefined } : l)),
+    areas: board.areas.filter((a) => !sel.areas.includes(a.id)),
+    symbols: board.symbols.filter((s) => !sel.symbols.includes(s.id)),
+    ellipses: board.ellipses.filter((el) => !sel.ellipses.includes(el.id)),
+    texts: board.texts.filter((t) => !sel.texts.includes(t.id)),
+    notes: board.notes.filter((n) => !sel.notes.includes(n.id)),
+    updatedAt: Date.now(),
+  };
+}
+
+type Tool = "line" | "curve" | "stretch" | "select" | "rect" | "ellipse" | "note" | "text" | "eraser" | "pan" | "area" | "ruler" | "lasso" | "scale" | "move";
+
+// Tools that share ONE selection (lassoSelection): switching between them
+// keeps whatever's selected, since "escalar"/"mover" only make sense as a
+// second step after "selecciona con select o lazo" — everything else
+// (drawing tools, eraser, pan, ...) clears the selection on entry.
+const SELECTION_TOOLS: readonly Tool[] = ["select", "lasso", "scale", "move"];
 
 type EditingValue = {
   id: string;
@@ -364,7 +454,6 @@ export default function CanvasBoard({ boardId }: { boardId: string }) {
   const [ortho, setOrtho] = useState(false);
   const [panelOpen, setPanelOpen] = useState(false);
   const [favoritesOpen, setFavoritesOpen] = useState(false);
-  const [selectedLineId, setSelectedLineId] = useState<string | null>(null);
   const [showDimensions, setShowDimensions] = useState(true);
 
   const [history, setHistory] = useState<BoardState[]>([]);
@@ -390,12 +479,17 @@ export default function CanvasBoard({ boardId }: { boardId: string }) {
   const [doorHingeReadout, setDoorHingeReadout] = useState<{ x: number; y: number; text: string } | null>(null);
   const [lassoPoints, setLassoPoints] = useState<Point[] | null>(null);
   const [lassoSelection, setLassoSelection] = useState<LassoSelection | null>(null);
+  const [eraserCursor, setEraserCursor] = useState<Point | null>(null);
 
   const stageRef = useRef<Konva.Stage>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const hasFitRef = useRef(false);
   const pinchRef = useRef<{ dist: number; center: Point; scale: number; pos: Point } | null>(null);
+  // Drives BOTH the 2-finger pinch and the 1-finger/mouse drag-to-scale
+  // paths for the "escalar" tool — same anchor+snapshot+reference-distance
+  // shape either way, just populated by a different gesture.
   const objectPinchRef = useRef<{ selection: LassoSelection; anchor: Point; dist: number; snapshot: SelectionSnapshot } | null>(null);
+  const moveOriginRef = useRef<{ selection: LassoSelection; snapshot: SelectionSnapshot; startWorld: Point } | null>(null);
   const stretchOriginRef = useRef<Point | null>(null);
   const stretchDragStartRef = useRef<Point | null>(null);
   const stretchConnectionsRef = useRef<{
@@ -444,7 +538,6 @@ export default function CanvasBoard({ boardId }: { boardId: string }) {
     setDrawingArea(null);
     setDrawingAreaChain(null);
     setDrawingBox(null);
-    setSelectedLineId(null);
     setFavoritesOpen(false);
     setEditingText(null);
     setEditingDoorWidth(null);
@@ -452,8 +545,14 @@ export default function CanvasBoard({ boardId }: { boardId: string }) {
     setLineAlignGuides(null);
     setRuler(null);
     setLassoPoints(null);
-    setLassoSelection(null);
+    setEraserCursor(null);
     objectPinchRef.current = null;
+    moveOriginRef.current = null;
+    // "escalar"/"mover" only exist as a second step after selecting with
+    // "select" or "lazo" — keep the selection when moving between any of
+    // those four tools, drop it for anything else (a new drawing tool,
+    // eraser, pan, ...).
+    if (!SELECTION_TOOLS.includes(t)) setLassoSelection(null);
     setToolRaw(t);
   }, []);
 
@@ -699,7 +798,7 @@ export default function CanvasBoard({ boardId }: { boardId: string }) {
           return [...pts, snapped];
         });
       } else if (tool === "select") {
-        setSelectedLineId(null);
+        setLassoSelection(null);
       } else if (tool === "ruler") {
         const threshold = SNAP_PX / scale;
         const snapped =
@@ -713,9 +812,32 @@ export default function CanvasBoard({ boardId }: { boardId: string }) {
         // it, which doubles as "tap empty space to deselect".
         setLassoSelection(null);
         setLassoPoints([world]);
+      } else if (tool === "scale" && lassoSelection && !lassoSelectionIsEmpty(lassoSelection)) {
+        // 1-finger/mouse version of the pinch: distance from the selection's
+        // own center to the pointer, tracked the same way a 2-finger pinch
+        // tracks the distance between the two touches (see handleTouchMove).
+        const bbox = computeSelectionBBox(boardRef.current, lassoSelection);
+        if (bbox) {
+          const anchor = { x: (bbox.minX + bbox.maxX) / 2, y: (bbox.minY + bbox.maxY) / 2 };
+          const anchorScreen = { x: anchor.x * scale + pos.x, y: anchor.y * scale + pos.y };
+          pushHistory();
+          objectPinchRef.current = {
+            selection: lassoSelection,
+            anchor,
+            dist: Math.max(distance(anchorScreen, pointer), 1),
+            snapshot: snapshotSelection(boardRef.current, lassoSelection),
+          };
+        }
+      } else if (tool === "move" && lassoSelection && !lassoSelectionIsEmpty(lassoSelection)) {
+        pushHistory();
+        moveOriginRef.current = {
+          selection: lassoSelection,
+          snapshot: snapshotSelection(boardRef.current, lassoSelection),
+          startWorld: world,
+        };
       }
     },
-    [tool, areaMode, scale, toWorld, allEndpoints, board.lines, gridStep, finalizeArea]
+    [tool, areaMode, scale, pos, toWorld, allEndpoints, board.lines, gridStep, finalizeArea, lassoSelection, pushHistory]
   );
 
   const handlePointerMove = useCallback(() => {
@@ -760,8 +882,19 @@ export default function CanvasBoard({ boardId }: { boardId: string }) {
       setRuler({ start: ruler.start, end: null, hover });
     } else if (tool === "lasso" && lassoPoints) {
       setLassoPoints([...lassoPoints, world]);
+    } else if (tool === "scale" && objectPinchRef.current) {
+      const g = objectPinchRef.current;
+      const anchorScreen = { x: g.anchor.x * scale + pos.x, y: g.anchor.y * scale + pos.y };
+      const k = clamp(distance(anchorScreen, pointer) / g.dist, PINCH_SCALE_MIN, PINCH_SCALE_MAX);
+      setBoard((b) => applyGroupScale(b, g.snapshot, g.anchor, k));
+    } else if (tool === "move" && moveOriginRef.current) {
+      const g = moveOriginRef.current;
+      const delta = { x: world.x - g.startWorld.x, y: world.y - g.startWorld.y };
+      setBoard((b) => applyGroupTranslate(b, g.snapshot, delta));
     }
-  }, [tool, drawingLine, drawingBox, drawingNote, ruler, lassoPoints, ortho, scale, toWorld, allEndpoints, board.lines, gridStep]);
+
+    if (tool === "eraser") setEraserCursor(world);
+  }, [tool, drawingLine, drawingBox, drawingNote, ruler, lassoPoints, ortho, scale, pos, toWorld, allEndpoints, board.lines, gridStep]);
 
   const handlePointerUp = useCallback(() => {
     if (tool === "line" && drawingLine) {
@@ -843,6 +976,10 @@ export default function CanvasBoard({ boardId }: { boardId: string }) {
         setLassoSelection(lassoSelectionIsEmpty(sel) ? null : sel);
       }
       setLassoPoints(null);
+    } else if (tool === "scale") {
+      objectPinchRef.current = null;
+    } else if (tool === "move") {
+      moveOriginRef.current = null;
     }
   }, [tool, drawingLine, drawingBox, drawingNote, lassoPoints, color, scale, pos, toWorld, pushHistory]);
 
@@ -1352,27 +1489,23 @@ export default function CanvasBoard({ boardId }: { boardId: string }) {
     lineDragGroupOriginRef.current = [];
   }, []);
 
-  // --- select: recolor / delete the selected line ---------------------------
+  // --- select/lasso: recolor / delete / scale / move whatever's selected ----
 
-  const handleRecolorSelected = useCallback(
+  const handleRecolorSelection = useCallback(
     (c: LineColor) => {
-      if (!selectedLineId) return;
+      if (!lassoSelection || lassoSelectionIsEmpty(lassoSelection)) return;
       pushHistory();
-      setBoard((b) => ({
-        ...b,
-        lines: b.lines.map((l) => (l.id === selectedLineId ? { ...l, color: c } : l)),
-        updatedAt: Date.now(),
-      }));
+      setBoard((b) => applyRecolorSelection(b, lassoSelection, c));
     },
-    [selectedLineId, pushHistory]
+    [lassoSelection, pushHistory]
   );
 
-  const handleDeleteSelected = useCallback(() => {
-    if (!selectedLineId) return;
+  const handleDeleteSelection = useCallback(() => {
+    if (!lassoSelection || lassoSelectionIsEmpty(lassoSelection)) return;
     pushHistory();
-    setBoard((b) => ({ ...b, lines: b.lines.filter((l) => l.id !== selectedLineId), updatedAt: Date.now() }));
-    setSelectedLineId(null);
-  }, [selectedLineId, pushHistory]);
+    setBoard((b) => applyDeleteSelection(b, lassoSelection));
+    setLassoSelection(null);
+  }, [lassoSelection, pushHistory]);
 
   // --- favoritos: stamp a door/window "dynamic block" at the view's center ---
 
@@ -1725,54 +1858,32 @@ export default function CanvasBoard({ boardId }: { boardId: string }) {
         return;
       }
 
-      // First frame of a fresh 2-finger gesture — decide what it targets,
-      // in priority order: an active lasso selection's box, a text label
-      // under the fingers, or (the default) zooming the whole canvas.
+      // First frame of a fresh 2-finger gesture. In the "escalar" tool, with
+      // something selected, it's always a scale gesture — no hit-testing:
+      // you already told the app what to scale by selecting it. Otherwise
+      // it's the default: zoom the whole canvas.
       setDrawingLine(null);
       setDrawingNote(null);
       setLassoPoints(null);
-      const worldCenter = toWorld(center);
-      const board = boardRef.current;
 
-      if (lassoSelection && !lassoSelectionIsEmpty(lassoSelection)) {
+      if (tool === "scale" && lassoSelection && !lassoSelectionIsEmpty(lassoSelection)) {
+        const board = boardRef.current;
         const bbox = computeSelectionBBox(board, lassoSelection);
         if (bbox) {
-          const margin = LASSO_BBOX_MARGIN / scale;
-          const inside =
-            worldCenter.x >= bbox.minX - margin &&
-            worldCenter.x <= bbox.maxX + margin &&
-            worldCenter.y >= bbox.minY - margin &&
-            worldCenter.y <= bbox.maxY + margin;
-          if (inside) {
-            pushHistory();
-            objectPinchRef.current = {
-              selection: lassoSelection,
-              anchor: { x: (bbox.minX + bbox.maxX) / 2, y: (bbox.minY + bbox.maxY) / 2 },
-              dist,
-              snapshot: snapshotSelection(board, lassoSelection),
-            };
-            return;
-          }
+          pushHistory();
+          objectPinchRef.current = {
+            selection: lassoSelection,
+            anchor: { x: (bbox.minX + bbox.maxX) / 2, y: (bbox.minY + bbox.maxY) / 2 },
+            dist,
+            snapshot: snapshotSelection(board, lassoSelection),
+          };
+          return;
         }
-      }
-
-      const hitRadius = TEXT_PINCH_HIT_RADIUS / scale;
-      const hitText = board.texts.find((t) => distance(worldCenter, { x: t.x, y: t.y }) <= hitRadius);
-      if (hitText) {
-        pushHistory();
-        const sel: LassoSelection = { ...emptyLassoSelection(), texts: [hitText.id] };
-        objectPinchRef.current = {
-          selection: sel,
-          anchor: { x: hitText.x, y: hitText.y },
-          dist,
-          snapshot: snapshotSelection(board, sel),
-        };
-        return;
       }
 
       pinchRef.current = { dist, center, scale, pos };
     },
-    [scale, pos, toWorld, clampPos, lassoSelection, pushHistory]
+    [tool, scale, pos, clampPos, lassoSelection, pushHistory]
   );
 
   const handleTouchEnd = useCallback((e: KonvaEventObject<TouchEvent>) => {
@@ -1909,8 +2020,8 @@ export default function CanvasBoard({ boardId }: { boardId: string }) {
 
   const totalM2 = board.areas.reduce((sum, a) => sum + polygonArea(a.points), 0);
 
-  const selectedLine = selectedLineId ? board.lines.find((l) => l.id === selectedLineId) ?? null : null;
   const showLabels = showDimensions && scale >= LABEL_MIN_SCALE;
+  const hasSelection = !!lassoSelection && !lassoSelectionIsEmpty(lassoSelection);
 
   return (
     <div className="h-dvh w-dvw flex flex-col bg-paper overflow-hidden">
@@ -1937,6 +2048,10 @@ export default function CanvasBoard({ boardId }: { boardId: string }) {
         onRedo={redo}
         canUndo={history.length > 0}
         canRedo={future.length > 0}
+        hasSelection={hasSelection}
+        onSelectionColor={handleRecolorSelection}
+        onSelectionDelete={handleDeleteSelection}
+        onSelectionClear={() => setLassoSelection(null)}
       />
 
       <div className="relative flex-1 min-h-0">
@@ -1982,6 +2097,7 @@ export default function CanvasBoard({ boardId }: { boardId: string }) {
                 handlePointerUp();
               }}
               onWheel={handleWheel}
+              onMouseLeave={() => setEraserCursor(null)}
               className={tool === "pan" ? "cursor-grab" : tool === "eraser" ? "cursor-cell" : "cursor-crosshair"}
             >
               <Layer listening={false}>
@@ -2223,18 +2339,6 @@ export default function CanvasBoard({ boardId }: { boardId: string }) {
                   />
                 ))}
 
-                {selectedLine && (
-                  <Line
-                    points={[selectedLine.x1, selectedLine.y1, selectedLine.mid.x, selectedLine.mid.y, selectedLine.x2, selectedLine.y2]}
-                    tension={0.5}
-                    stroke="#c2410c"
-                    strokeWidth={7 / scale}
-                    opacity={0.3}
-                    lineCap="round"
-                    listening={false}
-                  />
-                )}
-
                 {board.lines.map((l) => (
                   <Line
                     key={l.id}
@@ -2250,13 +2354,13 @@ export default function CanvasBoard({ boardId }: { boardId: string }) {
                     onDragEnd={handleLineDragEnd}
                     onClick={() => {
                       if (tool === "eraser") handleEraseShape(l.id, "measure");
-                      else if (tool === "select") setSelectedLineId(l.id);
+                      else if (tool === "select") setLassoSelection({ ...emptyLassoSelection(), lines: [l.id] });
                       else if (tool === "area" && areaMode === "lineas") handleAreaLineClick(l);
                       else openValueEditor(l);
                     }}
                     onTap={() => {
                       if (tool === "eraser") handleEraseShape(l.id, "measure");
-                      else if (tool === "select") setSelectedLineId(l.id);
+                      else if (tool === "select") setLassoSelection({ ...emptyLassoSelection(), lines: [l.id] });
                       else if (tool === "area" && areaMode === "lineas") handleAreaLineClick(l);
                       else openValueEditor(l);
                     }}
@@ -2595,6 +2699,17 @@ export default function CanvasBoard({ boardId }: { boardId: string }) {
                     );
                   })()}
 
+                {tool === "eraser" && eraserCursor && (
+                  <Circle
+                    x={eraserCursor.x}
+                    y={eraserCursor.y}
+                    radius={ERASER_CURSOR_RADIUS / scale}
+                    stroke="#1c1b1a"
+                    strokeWidth={1.5 / scale}
+                    listening={false}
+                  />
+                )}
+
                 {uniqueVertices.map((v, i) => (
                   <Circle key={i} x={v.x} y={v.y} radius={3 / scale} fill="#78716c" listening={false} />
                 ))}
@@ -2897,34 +3012,6 @@ export default function CanvasBoard({ boardId }: { boardId: string }) {
                 </button>
               </>
             )}
-          </div>
-        )}
-
-        {selectedLine && (
-          <div
-            className="absolute z-20 -translate-x-1/2 -translate-y-full flex items-center gap-2 rounded-lg border border-line bg-card px-3 py-2 shadow-lg"
-            style={{
-              left: ((selectedLine.x1 + selectedLine.x2) / 2) * scale + pos.x,
-              top: ((selectedLine.y1 + selectedLine.y2) / 2) * scale + pos.y - 14,
-            }}
-          >
-            {PEN_COLORS.map((c) => (
-              <button
-                key={c}
-                type="button"
-                onClick={() => handleRecolorSelected(c)}
-                aria-label={`Color ${c}`}
-                className={`h-6 w-6 rounded-full border-2 ${selectedLine.color === c ? "border-ink" : "border-transparent"}`}
-                style={{ backgroundColor: c }}
-              />
-            ))}
-            <button
-              type="button"
-              onClick={handleDeleteSelected}
-              className="rounded-md border border-line px-2.5 py-1 font-mono text-xs text-red-600"
-            >
-              Eliminar
-            </button>
           </div>
         )}
 
